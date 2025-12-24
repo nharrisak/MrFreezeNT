@@ -1,0 +1,205 @@
+﻿Design Document: MrFreeze (disting NT Plugin)
+1. Overview
+* Plugin Name: MrFreeze
+* GUID: NT_MULTICHAR( 'M', 'r', 'F', 'z' )
+* Inspiration: Elektron Octatrack Freeze Delay
+* Tags: kNT_tagEffect | kNT_tagDelay
+* Description: A rhythmic performance delay and looper. When "Frozen," it captures a sync’d loop of audio, mutes the dry input, and applies characterful degradation (Bit Crush, Tape Sat, Base/Width Filter) within a windowed feedback loop.
+________________
+
+
+2. Specifications (Load-time Configuration)
+These values are set when adding the plugin to a preset and determine DRAM allocation.
+Specification
+	Min
+	Max
+	Default
+	Type
+	Description
+	Max Delay Time
+	1
+	20
+	10
+	kNT_typeSeconds
+	Total stereo buffer size in DRAM.
+	________________
+
+
+3. Operational Logic
+* Dry/Wet Behavior: Unlike a standard mix-based delay, MrFreeze is an "insert" effect. When Freeze is active, the Dry input is cut (faded out), and only the Buffer (Wet) is heard.
+* Freeze State: * Off: Input is written to the buffer; Dry signal is heard; Feedback path is active.
+   * On: Writing to the buffer stops; Dry signal is muted; Buffer loops continuously.
+* Ping Pong: If enabled, the feedback path is cross-wired: the Left processed signal is written to the Right delay line, and the Right processed signal is written to the Left.
+* Equal Power Windowing: All state transitions (Freeze toggle, Time Division jumps) use an equal-power trigonometric crossfade over a window defined by Crossfade %.
+________________
+
+
+4. Signal Flow
+Input L/R → Buffer Read → Bit Crusher → Base/Width Filter → Tape Saturation → External FB Return → Auto-Limiter → Feedback Level → Write Head (with Ping Pong swap)
+________________
+
+
+5. Parameter Map
+Page 1: Routing & I/O
+Index
+	Name
+	Range
+	Default
+	Unit
+	Notes
+	0
+	Dry In L
+	1-28
+	1
+	kNT_unitAudioInput
+	
+
+	1
+	Dry In R
+	0-28
+	2
+	kNT_unitAudioInput
+	0 = Mono
+	2
+	FB In L
+	0-28
+	0
+	kNT_unitAudioInput
+	0 = Internal
+	3
+	FB In R
+	0-28
+	0
+	kNT_unitAudioInput
+	0 = Internal
+	4
+	Clock In
+	0-28
+	0
+	kNT_unitCvInput
+	Trigger source
+	5
+	Out L
+	1-28
+	13
+	kNT_unitAudioOutput
+	
+
+	6
+	Out R
+	1-28
+	14
+	kNT_unitAudioOutput
+	
+
+	Page 2: Performance & Timing
+Index
+	Name
+	Range
+	Default
+	Unit
+	Notes
+	7
+	Freeze
+	0-1
+	0
+	kNT_unitEnum
+	[Off, On]
+	8
+	Division
+	0-6
+	4
+	kNT_unitEnum
+	[1/64, 1/32... 1/1]
+	9
+	Triplet
+	0-2
+	0
+	kNT_unitEnum
+	[Off, x3, /3]
+	10
+	Dotted
+	0-1
+	0
+	kNT_unitEnum
+	[Off, x1.5]
+	11
+	Crossfade %
+	0-50
+	10
+	kNT_unitPercent
+	% of Division
+	12
+	Ping Pong
+	0-1
+	0
+	kNT_unitEnum
+	[Off, On]
+	13
+	Sync
+	0-2
+	1
+	kNT_unitEnum
+	[Int, Clock, MIDI]
+	Page 3: Character & Filter
+Index
+	Name
+	Range
+	Default
+	Unit
+	Notes
+	14
+	Feedback
+	0-100
+	50
+	kNT_unitPercent
+	Loop gain
+	15
+	Base
+	0-127
+	0
+	kNT_unitNone
+	HPF Cutoff
+	16
+	Width
+	0-127
+	127
+	kNT_unitNone
+	LPF relative to Base
+	17
+	Bit Depth
+	1-24
+	24
+	kNT_unitNone
+	24 to 1 bit
+	18
+	Lo-Fi SR
+	0-100
+	0
+	kNT_unitPercent
+	Sample rate reduction
+	19
+	Tape Sat
+	0-100
+	0
+	kNT_unitPercent
+	Soft-clip harmonics
+	________________
+
+
+6. Implementation Details
+Timing & Crossfade
+* The loop length ($L$) is derived from the master BPM and parameters 8, 9, and 10.
+* The crossfade window ($W$) is $L \times (Crossfade \% / 100)$.
+* Use a dual-pointer system: when $PointerA$ reaches $L - W$, $PointerB$ begins reading from 0. Crossfade between them using $sin(t)/cos(t)$ to maintain equal power.
+Feedback Character
+* Base/Width Filter: Two 2-pole filters in series. HPF cutoff = $Map(Base)$; LPF cutoff = $Map(Base + Width)$.
+* Tape Sat: Sigmoid soft-clipper: $f(x) = \frac{2}{\pi} \arctan(x \cdot Drive)$.
+* Auto-Limiter: Fixed safety ceiling at -0.1dB with a 50ms release.
+Hardware UI (disting NT Screen)
+* Visualizer: 256x32 scrolling waveform. Highlight the "Loop Region" when Frozen.
+* Filter UI: A horizontal bar at the bottom representing the frequency spectrum; highlight the pass-band between Base and Width.
+* Encoder Mapping:
+   * Encoder L: Time Division (Jump sync'd to beat).
+   * Encoder R: Feedback Amount.
+   * L-Button: Toggle Freeze.
