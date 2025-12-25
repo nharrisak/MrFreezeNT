@@ -27,8 +27,10 @@ struct MrFreezeAlgorithm : public _NT_algorithm {
     float crossfade;
     bool pingPong;
     int sync;
+    int midiChannel;
     float tempo;
     float feedback;
+    float resonance;
     float base, width;
     int bitDepth;
     float tapeSat;
@@ -36,8 +38,8 @@ struct MrFreezeAlgorithm : public _NT_algorithm {
     // State
     uint32_t bufferSize;
     uint32_t writeHead;
-    float lpfStateL[2], lpfStateR[2]; // Simple state for filters
-    float hpfStateL[2], hpfStateR[2];
+    BiquadState lpfStateL, lpfStateR;
+    BiquadState hpfStateL, hpfStateR;
 
     // Clock State
     float lastClockSample;
@@ -47,6 +49,7 @@ struct MrFreezeAlgorithm : public _NT_algorithm {
     // MIDI Clock State
     uint32_t framesSinceLastMidiClock;
     float detectedMidiBpm;
+    int activeNoteCount;
 
     // Limiter State
     float limiterEnvelope;
@@ -56,11 +59,14 @@ struct MrFreezeAlgorithm : public _NT_algorithm {
     uint32_t freezeStartPos;
     bool wasFrozen;
     uint32_t currentDelayLen;
+    float currentDryGain;
 
     // Tape State
     TapeState tapeL, tapeR;
     float lastSampleRate;
     float lastTapeSat;
+    float smoothedFBase;
+    float smoothedFWidth;
     float headBumpCoeffs[5];
     float hfRollOffCoeffs[5];
 };
@@ -81,8 +87,10 @@ enum {
     kParam_Crossfade,
     kParam_PingPong,
     kParam_Sync,
+    kParam_MidiChannel,
     kParam_Tempo,
     kParam_Feedback,
+    kParam_Resonance,
     kParam_Base,
     kParam_Width,
     kParam_BitDepth,
@@ -126,10 +134,12 @@ static const _NT_parameter parameters[kNumParameters] = {
     [kParam_Crossfade]= { .name = "Crossfade %",.min = 0, .max = 50, .def = 10, .unit = kNT_unitPercent },
     [kParam_PingPong] = { .name = "Ping Pong", .min = 0, .max = 1, .def = 0, .unit = kNT_unitEnum, .enumStrings = s_offOn },
     [kParam_Sync]     = { .name = "Sync",      .min = 0, .max = 2, .def = 1, .unit = kNT_unitEnum, .enumStrings = s_sync },
+    [kParam_MidiChannel] = { .name = "MIDI Ch", .min = 0, .max = 16, .def = 0, .unit = kNT_unitNone },
     [kParam_Tempo]    = { .name = "Tempo",     .min = 30, .max = 300, .def = 120, .unit = kNT_unitBPM },
 
     // Page 3: Character & Filter
     [kParam_Feedback] = { .name = "Feedback", .min = 0, .max = 100, .def = 50, .unit = kNT_unitPercent },
+    [kParam_Resonance]= { .name = "Resonance",.min = 0, .max = 100, .def = 30, .unit = kNT_unitPercent },
     [kParam_Base]     = { .name = "Base",     .min = 0, .max = 127, .def = 0, .unit = kNT_unitNone },
     [kParam_Width]    = { .name = "Width",    .min = 0, .max = 127, .def = 127, .unit = kNT_unitNone },
     [kParam_BitDepth] = { .name = "Bit Depth",.min = 1, .max = 24, .def = 24, .unit = kNT_unitNone },
@@ -139,8 +149,8 @@ static const _NT_parameter parameters[kNumParameters] = {
 
 // Parameter pages
 static const uint8_t page1[] = { kParam_DryInL, kParam_DryInR, kParam_FBInL, kParam_FBInR, kParam_ClockIn, kParam_OutL, kParam_OutR };
-static const uint8_t page2[] = { kParam_Freeze, kParam_Division, kParam_Triplet, kParam_Dotted, kParam_Crossfade, kParam_PingPong, kParam_Sync, kParam_Tempo };
-static const uint8_t page3[] = { kParam_Feedback, kParam_Base, kParam_Width, kParam_BitDepth, kParam_LoFiSR, kParam_TapeSat };
+static const uint8_t page2[] = { kParam_Freeze, kParam_Division, kParam_Triplet, kParam_Dotted, kParam_Crossfade, kParam_PingPong, kParam_Sync, kParam_MidiChannel, kParam_Tempo };
+static const uint8_t page3[] = { kParam_Feedback, kParam_Resonance, kParam_Base, kParam_Width, kParam_BitDepth, kParam_LoFiSR, kParam_TapeSat };
 
 static const _NT_parameterPage pages[] = {
     { .name = "Routing & I/O", .numParams = ARRAY_SIZE(page1), .params = page1 },
@@ -222,12 +232,46 @@ static inline float bitCrush(float x, int depth) {
     return (float)((int)(x * scale)) / scale;
 }
 
-// Helper: Simple 1-pole Filter
-static inline float processFilter(float input, float& state, float coeff, bool isHPF) {
-    // y[n] = y[n-1] + coeff * (x[n] - y[n-1])
-    state += coeff * (input - state);
-    if (isHPF) return input - state;
-    return state;
+// Helper: Calculate Biquad Coeffs (RBJ)
+enum { kFilterLPF, kFilterHPF };
+
+static void calcFilterCoeffs(int type, float fNorm, float Q, float* c) {
+    // fNorm = f / Sr. Max 0.5.
+    // omega = 2 * pi * fNorm.
+    // phase (0..1 for 0..pi/2) = 4 * fNorm.
+    
+    float phase = 4.0f * fNorm;
+    float sn, cs;
+    
+    if (phase <= 1.0f) {
+        sn = getSineInterp(phase);
+        cs = getSineInterp(1.0f - phase);
+    } else {
+        // phase 1..2 (pi/2 to pi)
+        sn = getSineInterp(2.0f - phase);
+        cs = -getSineInterp(phase - 1.0f);
+    }
+    
+    float alpha = sn / (2.0f * Q);
+    float a0_inv = 1.0f / (1.0f + alpha);
+    
+    if (type == kFilterLPF) {
+        float b1 = 1.0f - cs;
+        float b0 = b1 * 0.5f;
+        c[0] = b0 * a0_inv;
+        c[1] = b1 * a0_inv;
+        c[2] = b0 * a0_inv;
+        c[3] = (-2.0f * cs) * a0_inv;
+        c[4] = (1.0f - alpha) * a0_inv;
+    } else { // HPF
+        float b1 = -(1.0f + cs);
+        float b0 = -b1 * 0.5f;
+        c[0] = b0 * a0_inv;
+        c[1] = b1 * a0_inv;
+        c[2] = b0 * a0_inv;
+        c[3] = (-2.0f * cs) * a0_inv;
+        c[4] = (1.0f - alpha) * a0_inv;
+    }
 }
 
 // --- Core Functions ---
@@ -260,14 +304,17 @@ _NT_algorithm* construct(const _NT_algorithmMemoryPtrs& ptrs, const _NT_algorith
     
     // Initialize defaults
     alg->feedback = 0.5f;
+    alg->resonance = 0.3f;
     alg->freeze = false;
     alg->bitDepth = 24;
+    alg->base = 0.0f;
     alg->width = 1.0f;
     alg->dryInL = 1;
     alg->dryInR = 2;
     alg->outL = 13;
     alg->outR = 14;
     alg->sync = 1;
+    alg->midiChannel = 0;
     alg->division = 4;
     alg->tempo = 120.0f;
     alg->lastClockSample = 0.0f;
@@ -275,17 +322,26 @@ _NT_algorithm* construct(const _NT_algorithmMemoryPtrs& ptrs, const _NT_algorith
     alg->detectedBpm = 120.0f;
     alg->framesSinceLastMidiClock = 0;
     alg->detectedMidiBpm = 120.0f;
+    alg->activeNoteCount = 0;
     alg->limiterEnvelope = 0.0f;
     alg->loopPhase = 0;
     alg->freezeStartPos = 0;
     alg->wasFrozen = false;
     alg->currentDelayLen = 0;
+    alg->currentDryGain = 1.0f;
+    alg->crossfade = 10.0f;
+    alg->lpfStateL = {};
+    alg->lpfStateR = {};
+    alg->hpfStateL = {};
+    alg->hpfStateR = {};
     
     // Init Tape State
     alg->tapeL = {};
     alg->tapeR = {};
     alg->lastSampleRate = 0.0f;
     alg->lastTapeSat = -1.0f;
+    alg->smoothedFBase = 0.0005f;
+    alg->smoothedFWidth = 0.4505f;
     // Coeffs will be calc'd in step
     
     return (_NT_algorithm*)alg;
@@ -307,9 +363,12 @@ void parameterChanged(_NT_algorithm* self, int p) {
         case kParam_Division: pThis->division = (int)self->v[p]; break;
         case kParam_Triplet: pThis->triplet = (int)self->v[p]; break;
         case kParam_Dotted: pThis->dotted = (self->v[p] > 0.5f); break;
+        case kParam_Crossfade: pThis->crossfade = (float)self->v[p]; break;
         case kParam_Feedback: pThis->feedback = self->v[p] / 100.0f; break;
+        case kParam_Resonance: pThis->resonance = self->v[p] / 100.0f; break;
         case kParam_PingPong: pThis->pingPong = (self->v[p] > 0.5f); break;
         case kParam_Sync:   pThis->sync = (int)self->v[p]; break;
+        case kParam_MidiChannel: pThis->midiChannel = (int)self->v[p]; break;
         case kParam_Tempo:  pThis->tempo = (float)self->v[p]; break;
         case kParam_BitDepth: pThis->bitDepth = (int)self->v[p]; break;
         case kParam_TapeSat: pThis->tapeSat = self->v[p] / 100.0f; break;
@@ -335,6 +394,36 @@ void midiRealtime(_NT_algorithm* self, uint8_t byte) {
     }
 }
 
+void midiMessage(_NT_algorithm* self, uint8_t byte0, uint8_t byte1, uint8_t byte2) {
+    MrFreezeAlgorithm* pThis = (MrFreezeAlgorithm*)self;
+    int status = byte0 & 0xF0;
+    int channel = byte0 & 0x0F;
+
+    if (pThis->midiChannel > 0 && channel != (pThis->midiChannel - 1)) {
+        return;
+    }
+    
+    if (status == 0x90 && byte2 > 0) { // Note On
+        pThis->activeNoteCount++;
+        
+        // Map note to division (wrap around octave)
+        int div = byte1 % 12;
+        if (div <= 6) {
+            NT_setParameterFromAudio(NT_algorithmIndex(self), kParam_Division + NT_parameterOffset(), div);
+        }
+        
+        if (pThis->activeNoteCount == 1) {
+            NT_setParameterFromAudio(NT_algorithmIndex(self), kParam_Freeze + NT_parameterOffset(), 1);
+        }
+    } else if (status == 0x80 || (status == 0x90 && byte2 == 0)) { // Note Off
+        pThis->activeNoteCount--;
+        if (pThis->activeNoteCount <= 0) {
+            pThis->activeNoteCount = 0;
+            NT_setParameterFromAudio(NT_algorithmIndex(self), kParam_Freeze + NT_parameterOffset(), 0);
+        }
+    }
+}
+
 void step(_NT_algorithm* self, float* busFrames, int numFramesBy4) {
     MrFreezeAlgorithm* pThis = (MrFreezeAlgorithm*)self;
     int numFrames = numFramesBy4 * 4;
@@ -353,9 +442,26 @@ void step(_NT_algorithm* self, float* busFrames, int numFramesBy4) {
     const float* fbInL = (pThis->fbInL > 0) ? busFrames + (pThis->fbInL - 1) * numFrames : nullptr;
     const float* fbInR = (pThis->fbInR > 0) ? busFrames + (pThis->fbInR - 1) * numFrames : nullptr;
 
-    // Filter Coeffs (Simple mapping)
-    float hpfCoeff = pThis->base * 0.1f; 
-    float lpfCoeff = my_min(1.0f, (pThis->base + pThis->width) * 0.1f + 0.01f);
+    // Filter Coeffs (2-pole Resonant)
+    float hpfCoeffs[5], lpfCoeffs[5];
+    float Q = 0.707f + pThis->resonance * 9.0f; // Q from 0.7 to ~10
+    
+    // Map Base (0-1) to Freq Norm (20Hz - 20kHz approx)
+    // fNorm = 0.0005 + val^3 * 0.45
+    float baseSq = pThis->base * pThis->base * pThis->base;
+    float fBase = 0.0005f + baseSq * 0.45f;
+    float widthVal = my_min(1.0f, pThis->base + pThis->width);
+    float widthSq = widthVal * widthVal * widthVal;
+    float fWidth = 0.0005f + widthSq * 0.45f;
+
+    // Smoothing
+    float smoothing = 0.001f * numFrames;
+    if (smoothing > 1.0f) smoothing = 1.0f;
+    pThis->smoothedFBase += (fBase - pThis->smoothedFBase) * smoothing;
+    pThis->smoothedFWidth += (fWidth - pThis->smoothedFWidth) * smoothing;
+
+    calcFilterCoeffs(kFilterHPF, pThis->smoothedFBase, Q, hpfCoeffs);
+    calcFilterCoeffs(kFilterLPF, pThis->smoothedFWidth, Q, lpfCoeffs);
 
     // Update Tape Coeffs if SR changed
     float sr = (float)NT_globals.sampleRate;
@@ -446,6 +552,11 @@ void step(_NT_algorithm* self, float* busFrames, int numFramesBy4) {
     if (delayLen > pThis->bufferSize) delayLen = pThis->bufferSize;
     pThis->currentDelayLen = delayLen;
 
+    // Calculate Window Size
+    uint32_t W = (uint32_t)(delayLen * (pThis->crossfade / 100.0f));
+    if (W < 1) W = 1;
+    float dryFadeStep = 1.0f / (float)W;
+
     // Handle Freeze Transition
     if (pThis->freeze && !pThis->wasFrozen) {
         // Rising edge: Capture current write head as the start of our loop
@@ -459,16 +570,21 @@ void step(_NT_algorithm* self, float* busFrames, int numFramesBy4) {
         float inSampleL = dryL[i];
         float inSampleR = dryR[i];
 
+        // Update Dry Gain
+        if (pThis->freeze) {
+            pThis->currentDryGain -= dryFadeStep;
+            if (pThis->currentDryGain < 0.0f) pThis->currentDryGain = 0.0f;
+        } else {
+            pThis->currentDryGain += dryFadeStep;
+            if (pThis->currentDryGain > 1.0f) pThis->currentDryGain = 1.0f;
+        }
+
         // 2. Read from Delay Buffer (with Windowing if Frozen)
         float delayL, delayR;
 
         if (pThis->freeze) {
             uint32_t L = delayLen;
             if (pThis->loopPhase >= L) pThis->loopPhase = 0; // Safety clamp if L changed
-
-            // Calculate Window Size
-            uint32_t W = (uint32_t)(L * (pThis->crossfade / 100.0f));
-            if (W < 1) W = 1;
 
             // Pointer A (Main Loop)
             // We read backwards from the freeze point by L, then add phase
@@ -501,10 +617,10 @@ void step(_NT_algorithm* self, float* busFrames, int numFramesBy4) {
         delayR = bitCrush(delayR, pThis->bitDepth);
 
         // Filters (Base/Width)
-        delayL = processFilter(delayL, pThis->hpfStateL[0], hpfCoeff, true); // HPF
-        delayL = processFilter(delayL, pThis->lpfStateL[0], lpfCoeff, false); // LPF
-        delayR = processFilter(delayR, pThis->hpfStateR[0], hpfCoeff, true);
-        delayR = processFilter(delayR, pThis->lpfStateR[0], lpfCoeff, false);
+        delayL = processBiquad(delayL, pThis->hpfStateL, hpfCoeffs); // HPF
+        delayL = processBiquad(delayL, pThis->lpfStateL, lpfCoeffs); // LPF
+        delayR = processBiquad(delayR, pThis->hpfStateR, hpfCoeffs);
+        delayR = processBiquad(delayR, pThis->lpfStateR, lpfCoeffs);
 
         // Tape Saturation
         if (pThis->tapeSat > 0.0f) {
@@ -514,14 +630,10 @@ void step(_NT_algorithm* self, float* busFrames, int numFramesBy4) {
         }
 
         // 4. Output Mixing
-        // If Frozen: Dry is muted, only Wet (Buffer) is heard
-        if (pThis->freeze) {
-            outL[i] = delayL;
-            outR[i] = delayR;
-        } else {
-            outL[i] = inSampleL + delayL;
-            outR[i] = inSampleR + delayR;
-        }
+        // Apply inverse ramp to Wet signal to prevent pops
+        float gainWet = getSineInterp(1.0f - pThis->currentDryGain);
+        outL[i] = (inSampleL * pThis->currentDryGain) + (delayL * gainWet);
+        outR[i] = (inSampleR * pThis->currentDryGain) + (delayR * gainWet);
 
         // 5. Feedback & Write to Buffer
         float fbSourceL = delayL;
@@ -530,10 +642,10 @@ void step(_NT_algorithm* self, float* busFrames, int numFramesBy4) {
         if (fbInL) fbSourceL = fbInL[i];
         if (fbInR) fbSourceR = fbInR[i];
 
-        // If Frozen: Input is cut, Feedback is effectively 100% (looping)
-        float fbVal = pThis->freeze ? 1.0f : pThis->feedback;
-        float writeL = (pThis->freeze ? 0.0f : inSampleL) + fbSourceL * fbVal;
-        float writeR = (pThis->freeze ? 0.0f : inSampleR) + fbSourceR * fbVal;
+        float t = 1.0f - pThis->currentDryGain;
+        float fbVal = pThis->feedback + (1.0f - pThis->feedback) * t;
+        float writeL = (inSampleL * pThis->currentDryGain) + fbSourceL * fbVal;
+        float writeR = (inSampleR * pThis->currentDryGain) + fbSourceR * fbVal;
 
         // Ping Pong Swap
         if (pThis->pingPong) {
@@ -648,6 +760,7 @@ static const _NT_factory factory = {
     .step = step,
     .draw = draw,
     .midiRealtime = midiRealtime,
+    .midiMessage = midiMessage,
     .tags = (uint32_t)(kNT_tagEffect | kNT_tagDelay),
 };
 
