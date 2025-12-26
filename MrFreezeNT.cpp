@@ -2,6 +2,7 @@
 #include <new>
 #include <cstddef>
 #include <cstring>
+#include <math.h>
 
 // Algorithm state
 struct BiquadState {
@@ -56,14 +57,11 @@ struct MrFreezeAlgorithm : public _NT_algorithm {
     int activeNoteCount;
 
     // Limiter State
-    float limiterEnvelope;
+    float limiterGain;
 
     // Loop State
-    uint32_t loopPhase;
-    uint32_t freezeStartPos;
     bool wasFrozen;
     uint32_t currentDelayLen;
-    uint32_t frozenDelayLen;
     float currentDryGain;
 
     // Tape State
@@ -72,6 +70,7 @@ struct MrFreezeAlgorithm : public _NT_algorithm {
     float lastTapeSat;
     float smoothedFBase;
     float smoothedFWidth;
+    float smoothedDelayLen;
     float headBumpCoeffs[5];
     float hfRollOffCoeffs[5];
 };
@@ -364,12 +363,9 @@ _NT_algorithm* construct(const _NT_algorithmMemoryPtrs& ptrs, const _NT_algorith
     alg->framesSinceLastMidiClock = 0;
     alg->detectedMidiBpm = 120.0f;
     alg->activeNoteCount = 0;
-    alg->limiterEnvelope = 0.0f;
-    alg->loopPhase = 0;
-    alg->freezeStartPos = 0;
+    alg->limiterGain = 1.0f;
     alg->wasFrozen = false;
     alg->currentDelayLen = 0;
-    alg->frozenDelayLen = 96000; // Safe default
     alg->currentDryGain = 1.0f;
     alg->crossfade = 10.0f;
     alg->lpfStateL = {};
@@ -384,6 +380,7 @@ _NT_algorithm* construct(const _NT_algorithmMemoryPtrs& ptrs, const _NT_algorith
     alg->lastTapeSat = -1.0f;
     alg->smoothedFBase = 0.0005f;
     alg->smoothedFWidth = 0.4505f;
+    alg->smoothedDelayLen = 48000.0f;
     // Coeffs will be calc'd in step
     
     return (_NT_algorithm*)alg;
@@ -453,7 +450,7 @@ void midiMessage(_NT_algorithm* self, uint8_t byte0, uint8_t byte1, uint8_t byte
         
         // Map note to division (wrap around octave)
         int div = byte1 % 12;
-        if (div <= 6) {
+        if (div <= 8) {
             NT_setParameterFromAudio(NT_algorithmIndex(self), kParam_Division + NT_parameterOffset(), div);
         }
         
@@ -551,10 +548,12 @@ void step(_NT_algorithm* self, float* busFrames, int numFramesBy4) {
         pThis->hfRollOffCoeffs[4] = (1.0f - alphaHF) / a0HF;
     }
 
-    // Limiter constants
-    // exp(-1 / (SR * 0.05)) approx 1 - 1/(SR*0.05)
-    float releaseFactor = 1.0f - (1.0f / (NT_globals.sampleRate * 0.05f));
-    float threshold = 0.9885f; // -0.1 dB
+    // Limiter constants (Sample-rate independent)
+    float lookAheadMs = 2.0f;
+    uint32_t lookAheadSamples = (uint32_t)(sr * (lookAheadMs * 0.001f));
+    float atkCoeff = 1.0f - expf(-1.0f / (sr * 0.001f)); // 1ms Attack
+    float relCoeff = 1.0f - expf(-1.0f / (sr * 0.050f)); // 50ms Release
+    const float kLimThreshold = 0.944f; // -0.5 dB
 
     // Determine BPM
     float bpm = 120.0f;
@@ -616,10 +615,7 @@ void step(_NT_algorithm* self, float* busFrames, int numFramesBy4) {
 
     // Handle Freeze Transition
     if (pThis->freeze && !pThis->wasFrozen) {
-        // Rising edge: Capture current write head as the start of our loop
-        pThis->freezeStartPos = pThis->writeHead;
-        pThis->frozenDelayLen = delayLen;
-        pThis->loopPhase = 0;
+        // No special state reset needed for continuous tape model
     }
     pThis->wasFrozen = pThis->freeze;
 
@@ -640,64 +636,28 @@ void step(_NT_algorithm* self, float* busFrames, int numFramesBy4) {
             if (pThis->currentDryGain > 1.0f) pThis->currentDryGain = 1.0f;
         }
 
-        // 2. Read from Delay Buffer (with Windowing if Frozen)
-        float delayL, delayR;
+        // 1. Smooth the delay length to prevent clicks and allow "tape" pitch effects
+        float targetLen = (float)pThis->currentDelayLen;
+        pThis->smoothedDelayLen += (targetLen - pThis->smoothedDelayLen) * 0.001f;
 
-        if (pThis->freeze) {
-            uint32_t L = pThis->frozenDelayLen;
-            
-            // Determine Cycle Length (PingPong is 2x)
-            uint32_t cycleLen = (pThis->loopMode == 2) ? (L * 2) : L;
-            if (pThis->loopPhase >= cycleLen) pThis->loopPhase = 0;
-            
-            // Calculate Window Size for Loop Crossfade based on Frozen Length
-            uint32_t W_loop = (uint32_t)(L * (pThis->crossfade / 100.0f));
-            if (W_loop < 1) W_loop = 1;
+        // 2. Calculate Fractional Read Position
+        // We look "backwards" from the current write head
+        float readPos = (float)pThis->writeHead - pThis->smoothedDelayLen;
 
-            // Determine Playback Direction and Phase
-            bool isReverse = (pThis->loopMode == 1); // Rev
-            uint32_t phase = pThis->loopPhase;
-            
-            if (pThis->loopMode == 2) { // PingPong
-                if (phase >= L) {
-                    isReverse = true;
-                    phase = phase - L; // Phase 0..L for the reverse segment
-                }
-            }
+        // Wrap the floating point pointer within the circular buffer
+        while (readPos < 0.0f) readPos += (float)pThis->bufferSize;
+        while (readPos >= (float)pThis->bufferSize) readPos -= (float)pThis->bufferSize;
 
-            // Pointer A
-            uint32_t ptrA;
-            if (isReverse) {
-                ptrA = (pThis->freezeStartPos + pThis->bufferSize - 1 - phase) % pThis->bufferSize;
-            } else {
-                ptrA = (pThis->freezeStartPos + pThis->bufferSize - L + phase) % pThis->bufferSize;
-            }
-            delayL = pThis->audioBuffer[ptrA * 2];
-            delayR = pThis->audioBuffer[ptrA * 2 + 1];
+        // 3. Linear Interpolation
+        uint32_t idxA = (uint32_t)readPos;
+        uint32_t idxB = (idxA + 1) % pThis->bufferSize;
+        float fraction = readPos - (float)idxA;
 
-            // Crossfade Window (Only for Fwd/Rev modes, PingPong is continuous)
-            if (pThis->loopMode != 2 && phase >= (L - W_loop)) {
-                float t = (float)(phase - (L - W_loop)) / (float)W_loop; // 0.0 to 1.0
-                float gainA = getSineInterp(1.0f - t); // cos(x) = sin(pi/2 - x)
-                float gainB = getSineInterp(t);        // sin(x)
-
-                // Pointer B (Start of Loop)
-                uint32_t offsetB = phase - (L - W_loop);
-                uint32_t ptrB;
-                if (isReverse) {
-                    ptrB = (pThis->freezeStartPos + pThis->bufferSize - 1 - offsetB) % pThis->bufferSize;
-                } else {
-                    ptrB = (pThis->freezeStartPos + pThis->bufferSize - L + offsetB) % pThis->bufferSize;
-                }
-                
-                delayL = delayL * gainA + pThis->audioBuffer[ptrB * 2] * gainB;
-                delayR = delayR * gainA + pThis->audioBuffer[ptrB * 2 + 1] * gainB;
-            }
-        } else {
-            uint32_t readPos = (pThis->writeHead + pThis->bufferSize - delayLen) % pThis->bufferSize;
-            delayL = pThis->audioBuffer[readPos * 2];
-            delayR = pThis->audioBuffer[readPos * 2 + 1];
-        }
+        // Sample the two nearest points and blend
+        float delayL = pThis->audioBuffer[idxA * 2] * (1.0f - fraction) + 
+                       pThis->audioBuffer[idxB * 2] * fraction;
+        float delayR = pThis->audioBuffer[idxA * 2 + 1] * (1.0f - fraction) + 
+                       pThis->audioBuffer[idxB * 2 + 1] * fraction;
 
         // 3. Process Effects on the Wet Signal (Buffer Read)
         // Bit Crush
@@ -719,6 +679,33 @@ void step(_NT_algorithm* self, float* busFrames, int numFramesBy4) {
             delayR = processTape(delayR, drive, pThis->tapeR, pThis->headBumpCoeffs, pThis->hfRollOffCoeffs);
         }
 
+        // --- Transparent Look-Ahead Limiter ---
+        // 1. Look-Ahead Detection
+        float futureReadPos = readPos + (float)lookAheadSamples;
+        while (futureReadPos < 0.0f) futureReadPos += (float)pThis->bufferSize;
+        while (futureReadPos >= (float)pThis->bufferSize) futureReadPos -= (float)pThis->bufferSize;
+
+        uint32_t fIdxA = (uint32_t)futureReadPos;
+        uint32_t fIdxB = (fIdxA + 1) % pThis->bufferSize;
+        float fFrac = futureReadPos - (float)fIdxA;
+
+        float fL = pThis->audioBuffer[fIdxA * 2] * (1.0f - fFrac) + pThis->audioBuffer[fIdxB * 2] * fFrac;
+        float fR = pThis->audioBuffer[fIdxA * 2 + 1] * (1.0f - fFrac) + pThis->audioBuffer[fIdxB * 2 + 1] * fFrac;
+        float futureMax = my_max(my_abs(fL), my_abs(fR));
+
+        // 2. Calculate Target Gain
+        float targetGain = 1.0f;
+        if (futureMax > kLimThreshold) {
+            targetGain = kLimThreshold / futureMax;
+        }
+
+        // 3. Apply Smoothed Gain
+        float currentCoeff = (targetGain < pThis->limiterGain) ? atkCoeff : relCoeff;
+        pThis->limiterGain += currentCoeff * (targetGain - pThis->limiterGain);
+
+        delayL *= pThis->limiterGain;
+        delayR *= pThis->limiterGain;
+
         // 4. Output Mixing
         float gainDry = getSineInterp(pThis->currentDryGain);
         float gainWet = getSineInterp(1.0f - pThis->currentDryGain);
@@ -739,8 +726,12 @@ void step(_NT_algorithm* self, float* busFrames, int numFramesBy4) {
         if (fbInR) fbSourceR = fbInR[i];
 
         float fbVal = pThis->feedback * pThis->feedback; // Audio taper (squared)
-        float writeL = (inSampleL * pThis->currentDryGain) + fbSourceL * fbVal;
-        float writeR = (inSampleR * pThis->currentDryGain) + fbSourceR * fbVal;
+        
+        // Fade feedback to 0% when recording (gainWet goes to 0)
+        float currentFb = fbVal * gainWet;
+        
+        float writeL = (inSampleL * gainDry) + (fbSourceL * currentFb);
+        float writeR = (inSampleR * gainDry) + (fbSourceR * currentFb);
 
         // Ping Pong Swap
         if (pThis->pingPong) {
@@ -749,31 +740,13 @@ void step(_NT_algorithm* self, float* busFrames, int numFramesBy4) {
             writeR = temp;
         }
 
-        //Auto-Limiter (Safety)
-        float maxAbs = my_max(my_abs(writeL), my_abs(writeR));
-        if (maxAbs > pThis->limiterEnvelope) {
-            pThis->limiterEnvelope = maxAbs;
-        } else {
-            pThis->limiterEnvelope *= releaseFactor;
-        }
-        if (pThis->limiterEnvelope > threshold) {
-            float gain = threshold / pThis->limiterEnvelope;
-            writeL *= gain;
-            writeR *= gain;
-        }
-
-        if (pThis->freeze) {
-            // Destructive Loop Overdub
-            uint32_t L = pThis->frozenDelayLen;
-            uint32_t writePos = (pThis->freezeStartPos + pThis->bufferSize - L + pThis->loopPhase) % pThis->bufferSize;
-            pThis->audioBuffer[writePos * 2] = writeL;
-            pThis->audioBuffer[writePos * 2 + 1] = writeR;
-            pThis->loopPhase++;
-        } else {
-            pThis->audioBuffer[pThis->writeHead * 2] = writeL;
-            pThis->audioBuffer[pThis->writeHead * 2 + 1] = writeR;
-            pThis->writeHead = (pThis->writeHead + 1) % pThis->bufferSize;
-        }
+        // 5. Feedback & Write Ahead
+        // The writeHead ALWAYS moves forward, even in freeze, to record the "history"
+        pThis->audioBuffer[pThis->writeHead * 2] = writeL;
+        pThis->audioBuffer[pThis->writeHead * 2 + 1] = writeR;
+        
+        // Standard increment - the history is preserved behind us
+        pThis->writeHead = (pThis->writeHead + 1) % pThis->bufferSize;
     }
 
     // Update MIDI clock counter
@@ -806,11 +779,11 @@ bool draw(_NT_algorithm* self) {
     // Draw border
     NT_drawShapeI(kNT_box, 0, 32, 255, 63, 5);
 
-    uint32_t L = pThis->freeze ? pThis->frozenDelayLen : pThis->currentDelayLen;
+    uint32_t L = pThis->currentDelayLen;
     if (L < 1) L = 1;
     
     // Determine end position (most recent write or freeze point)
-    uint32_t endPos = pThis->freeze ? pThis->freezeStartPos : pThis->writeHead;
+    uint32_t endPos = pThis->writeHead;
     
     int yBase = 48;
     int lastY = yBase;
@@ -831,20 +804,6 @@ bool draw(_NT_algorithm* self) {
             NT_drawShapeI(kNT_line, x - 1, lastY, x, y, 15);
         }
         lastY = y;
-    }
-
-    if (pThis->freeze) {
-        // Draw Play Head
-        int xPhase = (int)((pThis->loopPhase * 256) / L);
-        if (xPhase >= 0 && xPhase < 256) {
-            NT_drawShapeI(kNT_line, xPhase, 32, xPhase, 63, 10);
-        }
-        // Draw Crossfade Point (End of loop)
-        int wPix = (int)(256.0f * pThis->crossfade / 100.0f);
-        int xFade = 256 - wPix;
-        if (xFade < 256 && xFade >= 0) {
-             NT_drawShapeI(kNT_line, xFade, 32, xFade, 63, 8);
-        }
     }
 
     return false;
