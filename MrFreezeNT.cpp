@@ -12,6 +12,7 @@ struct BiquadState {
 struct TapeState {
     BiquadState headBump;
     BiquadState hfRollOff;
+    BiquadState dcBlock;
     float lastPreSat;
 };
 
@@ -77,6 +78,8 @@ struct MrFreezeAlgorithm : public _NT_algorithm {
     float headBumpCoeffs[5];
     float hfRollOffCoeffs[5];
     uint32_t rngState;
+    float reversePhase;
+    int lastLoopMode;
 };
 
 // Parameter indices
@@ -243,37 +246,43 @@ static inline float processBiquad(float x, BiquadState& s, const float* c) {
     return y;
 }
 
-// Helper: Subtle Soft-Clipping
 static inline float saturate(float x) {
-    // Standard soft-clipper: f(x) = (3x - x^3) / 2
-    // This provides a smooth transition to 1.0 without a hard edge.
-    if (x > 1.0f) return 1.0f;
-    if (x < -1.0f) return -1.0f;
-    return x * (1.5f - 0.5f * x * x);
+    // Fast approximation of tanh(x)
+    // Very stable for feedback loops
+    if (x >= 3.0f) return 1.0f;
+    if (x <= -3.0f) return -1.0f;
+    return x * (27.0f + x * x) / (27.0f + 9.0f * x * x);
+}
+
+static inline float applyHysteresis(float in, float& state, float amount) {
+    // amount = 0 (transparent) to 1 (heavy smear)
+    float target = saturate(in);
+    // A simple one-pole lag mimics the 'lag' in magnetic alignment
+    float coeff = 0.5f + (0.45f * (1.0f - amount)); 
+    state = state + coeff * (target - state);
+    return state;
 }
 
 // Helper: Tape Saturation Chain
-// --- Refined processTape Helper ---
-static inline float processTape(float x, float drive, float amount, TapeState& s, const float* hbCoeffs, const float* hfCoeffs) {
-    // 1. Process the "Wet" path through the Head Bump filter
-    float bumped = processBiquad(x, s.headBump, hbCoeffs);
+static inline float processTape(float x, float drive, float amount, TapeState& s, const float* hfCoeffs, const float* dcCoeffs) {
+    // 1. DC Blocker (Essential to prevent bias from exploding the loop)
+    float in = processBiquad(x, s.dcBlock, dcCoeffs);
     
-    // 2. Normalize ONLY the bumped signal (offsetting its +3dB boost)
-    float normalizedBump = bumped * 0.707f; 
+    // 2. Add Asymmetrical Bias (Even harmonics/Warmth)
+    // Small offset before saturation creates 'warm' even-order harmonics
+    float biased = (in * drive) + (0.03f * amount);
 
-    // 3. Apply Drive to the normalized signal
-    float driven = normalizedBump * drive; 
-    
-    // 4. 2x Oversampled Saturation
-    float mid = 0.5f * (driven + s.lastPreSat);
-    float satResult = 0.5f * (saturate(mid) + saturate(driven));
-    s.lastPreSat = driven;
+    // 3. Hysteresis / Smear (Memory Effect)
+    // s.lastPreSat acts as the 'magnetic memory'
+    float saturated = applyHysteresis(biased, s.lastPreSat, amount);
+
+    // 4. Subtract Bias to center signal before HF roll-off
+    saturated -= (0.02f * amount);
 
     // 5. High-Frequency Roll-off (Warmth)
-    float warmed = processBiquad(satResult, s.hfRollOff, hfCoeffs);
+    float warmed = processBiquad(saturated, s.hfRollOff, hfCoeffs);
 
-    // 6. Crossfade based on 'amount'
-    // If amount is 0.0, it returns exactly the input 'x', ensuring 100% feedback works.
+    // 6. Unity-Gain Blend
     return (x * (1.0f - amount)) + (warmed * amount);
 }
 
@@ -407,6 +416,8 @@ _NT_algorithm* construct(const _NT_algorithmMemoryPtrs& ptrs, const _NT_algorith
     alg->fadePhase = 1.0f;
     // Coeffs will be calc'd in step
     alg->rngState = 0x5EED;
+    alg->reversePhase = 0.0f;
+    alg->lastLoopMode = 0;
     
     return (_NT_algorithm*)alg;
 }
@@ -522,43 +533,27 @@ void step(_NT_algorithm* self, float* busFrames, int numFramesBy4) {
     const float* fbInR = (fbInRIdx > 0) ? busFrames + (fbInRIdx - 1) * numFrames : nullptr;
 
     // Filter Coeffs (2-pole Resonant)
-    float hpfCoeffs[5], lpfCoeffs[5];
+    float hpfCoeffs[5], lpfCoeffs[5], dcCoeffs[5];
     float Q = 0.707f * getLinearInterp(pThis->resonance, kPow20Table); // Logarithmic Q from 0.7 to ~14
     
-    // Smoothing the linear parameter before exponential conversion is more effective
-    const float kParamSlew = 0.002f;
-    pThis->smoothedBase += (pThis->base - pThis->smoothedBase) * kParamSlew;
-    pThis->smoothedWidth += (pThis->width - pThis->smoothedWidth) * kParamSlew;
-
     // Map Base (0-1) to Freq Norm (20Hz - 20kHz approx)
     // Logarithmic mapping: f = f_min * (ratio)^val
     float fBase = 0.00025f * getLinearInterp(pThis->smoothedBase, kPow1000Table);
-    float widthVal = my_min(1.0f, pThis->smoothedBase + pThis->smoothedWidth);
+    float widthVal = pThis->smoothedBase + (pThis->smoothedWidth * (1.0f - pThis->smoothedBase));
     float fWidth = 0.00025f * getLinearInterp(widthVal, kPow1000Table);
 
     calcFilterCoeffs(kFilterHPF, fBase, Q, hpfCoeffs);
     calcFilterCoeffs(kFilterLPF, fWidth, Q, lpfCoeffs);
+    
+    float sr = (float)NT_globals.sampleRate;
+    calcFilterCoeffs(kFilterHPF, 20.0f / sr, 0.707f, dcCoeffs);
 
     // Update Tape Coeffs if SR changed
-    float sr = (float)NT_globals.sampleRate;
     if (sr != pThis->lastSampleRate || pThis->tapeSat != pThis->lastTapeSat) {
         pThis->lastSampleRate = sr;
         pThis->lastTapeSat = pThis->tapeSat;
         
-        // 1. Head Bump: 80Hz, Q=0.707, +3dB
-        float phaseHB = 4.0f * 80.0f / sr;
-        float snHB = getSineInterp(phaseHB);
-        float csHB = getSineInterp(1.0f - phaseHB);
-        float alphaHB = snHB / (2.0f * 0.707f);
-        float A = 1.0f + pThis->tapeSat * 0.1885f; // Scale Gain from 0dB (1.0) to +3dB (1.1885)
-        float a0HB = 1.0f + alphaHB / A;
-        pThis->headBumpCoeffs[0] = (1.0f + alphaHB * A) / a0HB;
-        pThis->headBumpCoeffs[1] = (-2.0f * csHB) / a0HB;
-        pThis->headBumpCoeffs[2] = (1.0f - alphaHB * A) / a0HB;
-        pThis->headBumpCoeffs[3] = (-2.0f * csHB) / a0HB;
-        pThis->headBumpCoeffs[4] = (1.0f - alphaHB / A) / a0HB;
-
-        // 2. HF Roll-off: 12000Hz, Q=0.707, LPF
+        // 1. HF Roll-off: 12000Hz, Q=0.707, LPF
         float phaseHF = 4.0f * 12000.0f / sr;
         float snHF = getSineInterp(phaseHF);
         float csHF = getSineInterp(1.0f - phaseHF);
@@ -643,9 +638,6 @@ void step(_NT_algorithm* self, float* busFrames, int numFramesBy4) {
     }
     pThis->wasFrozen = pThis->freeze;
 
-    bool bypassHPF = (pThis->smoothedBase <= 0.0f);
-    bool bypassLPF = ((pThis->smoothedBase + pThis->smoothedWidth) >= 1.0f);
-
     for (int i = 0; i < numFrames; ++i) {
         // 1. Read Input
         float inSampleL = dryL[i];
@@ -660,14 +652,26 @@ void step(_NT_algorithm* self, float* busFrames, int numFramesBy4) {
             if (pThis->currentDryGain > 1.0f) pThis->currentDryGain = 1.0f;
         }
 
+        // Smoothing
+        const float kParamSlew = 0.002f;
+        pThis->smoothedBase += (pThis->base - pThis->smoothedBase) * kParamSlew;
+        pThis->smoothedWidth += (pThis->width - pThis->smoothedWidth) * kParamSlew;
+
         // 1. Detect Macro Jumps (e.g., changing divisions)
         float targetLen = (float)pThis->currentDelayLen;
         float jumpDiff = my_abs(targetLen - pThis->fadeTargetLen);
+        
+        if (pThis->loopMode != pThis->lastLoopMode) {
+            jumpDiff = 1000.0f; // Force jump
+            pThis->lastLoopMode = pThis->loopMode;
+        }
+
         if (jumpDiff > 100.0f) { // 100 sample threshold
             pThis->fadeOldLen = pThis->smoothedDelayLen;
             pThis->fadeTargetLen = targetLen;
             pThis->smoothedDelayLen = targetLen; // Instantly jump to the new length
             pThis->fadePhase = 0.0f; // Reset crossfade progress
+            pThis->reversePhase = 0.0f;
         } else {
             pThis->fadeTargetLen = targetLen;
         }
@@ -677,7 +681,19 @@ void step(_NT_algorithm* self, float* busFrames, int numFramesBy4) {
         pThis->smoothedDelayLen += (pThis->fadeTargetLen - pThis->smoothedDelayLen) * 0.001f;
 
         // 3. Read Main Tap (Tap A)
-        float readPos = (float)pThis->writeHead - pThis->smoothedDelayLen;
+        float readPos = 0.0f;
+        
+        if (pThis->loopMode == 1) { // Reverse
+            pThis->reversePhase += 2.0f;
+            while (pThis->reversePhase >= pThis->smoothedDelayLen) {
+                pThis->reversePhase -= pThis->smoothedDelayLen;
+            }
+            readPos = (float)pThis->writeHead - pThis->reversePhase;
+        } else {
+            pThis->reversePhase = 0.0f;
+            readPos = (float)pThis->writeHead - pThis->smoothedDelayLen;
+        }
+
         while (readPos < 0.0f) readPos += (float)pThis->bufferSize;
         while (readPos >= (float)pThis->bufferSize) readPos -= (float)pThis->bufferSize;
 
@@ -723,17 +739,31 @@ void step(_NT_algorithm* self, float* busFrames, int numFramesBy4) {
         }
 
         // Filters (Base/Width)
-        if (!bypassHPF) delayL = processBiquad(delayL, pThis->hpfStateL, hpfCoeffs); // HPF
-        if (!bypassLPF) delayL = processBiquad(delayL, pThis->lpfStateL, lpfCoeffs); // LPF
-        if (!bypassHPF) delayR = processBiquad(delayR, pThis->hpfStateR, hpfCoeffs);
-        if (!bypassLPF) delayR = processBiquad(delayR, pThis->lpfStateR, lpfCoeffs);
+        // HPF Bypass Logic
+        if (pThis->smoothedBase <= 0.0001f) {
+            pThis->hpfStateL = {};
+            pThis->hpfStateR = {};
+        } else {
+            delayL = processBiquad(delayL, pThis->hpfStateL, hpfCoeffs);
+            delayR = processBiquad(delayR, pThis->hpfStateR, hpfCoeffs);
+        }
+
+        // LPF Bypass Logic
+        float currentWidthVal = pThis->smoothedBase + (pThis->smoothedWidth * (1.0f - pThis->smoothedBase));
+        if (currentWidthVal >= 0.9999f) {
+            pThis->lpfStateL = {};
+            pThis->lpfStateR = {};
+        } else {
+            delayL = processBiquad(delayL, pThis->lpfStateL, lpfCoeffs);
+            delayR = processBiquad(delayR, pThis->lpfStateR, lpfCoeffs);
+        }
 
         // Tape Saturation (Always On)
         // Map the 0-100% parameter to 1.0 (clean) to 1.5 (warm/saturated)
         float tapeAmount = pThis->tapeSat; // 0.0 to 1.0
         float drive = 1.0f + (tapeAmount * 0.5f);
-        delayL = processTape(delayL, drive, tapeAmount, pThis->tapeL, pThis->headBumpCoeffs, pThis->hfRollOffCoeffs);
-        delayR = processTape(delayR, drive, tapeAmount, pThis->tapeR, pThis->headBumpCoeffs, pThis->hfRollOffCoeffs);
+        delayL = processTape(delayL, drive, tapeAmount, pThis->tapeL, pThis->hfRollOffCoeffs, dcCoeffs);
+        delayR = processTape(delayR, drive, tapeAmount, pThis->tapeR, pThis->hfRollOffCoeffs, dcCoeffs);
 
         // --- Transparent Look-Ahead Limiter ---
         // 1. Look-Ahead Detection
