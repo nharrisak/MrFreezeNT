@@ -10,8 +10,6 @@ struct BiquadState {
 };
 
 struct TapeState {
-    BiquadState headBump;
-    BiquadState hfRollOff;
     BiquadState dcBlock;
     float lastPreSat;
 };
@@ -40,6 +38,8 @@ struct MrFreezeAlgorithm : public _NT_algorithm {
     float base, width;
     int bitDepth;
     float tapeSat;
+    float lofiSR;
+    float lofiSmooth;
 
     // State
     uint32_t bufferSize;
@@ -75,11 +75,16 @@ struct MrFreezeAlgorithm : public _NT_algorithm {
     float fadeTargetLen;
     float fadeOldLen;
     float fadePhase;
-    float headBumpCoeffs[5];
-    float hfRollOffCoeffs[5];
     uint32_t rngState;
     float reversePhase;
     int lastLoopMode;
+    float lofiCounter;
+    float lastLofiSampleL;
+    float lastLofiSampleR;
+    float prevLofiSampleL;
+    float prevLofiSampleR;
+    float lofiPreFilterL;
+    float lofiPreFilterR;
 };
 
 // Parameter indices
@@ -109,6 +114,7 @@ enum {
     kParam_Width,
     kParam_BitDepth,
     kParam_LoFiSR,
+    kParam_LoFiSmooth,
     kParam_TapeSat,
     kNumParameters
 };
@@ -154,19 +160,20 @@ static const _NT_parameter parameters[] = {
     [kParam_Tempo]    = { .name = "Tempo",     .min = 30, .max = 300, .def = 120, .unit = kNT_unitBPM },
 
     // Page 3: Character & Filter
-    [kParam_Feedback] = { .name = "Feedback", .min = 0, .max = 100, .def = 100, .unit = kNT_unitPercent },
+    [kParam_Feedback] = { .name = "Feedback", .min = -60, .max = 6, .def = 0, .unit = kNT_unitDb_minInf },
     [kParam_Resonance]= { .name = "Resonance",.min = 0, .max = 100, .def = 0, .unit = kNT_unitPercent },
     [kParam_Base]     = { .name = "Base",     .min = 0, .max = 127, .def = 0, .unit = kNT_unitNone },
     [kParam_Width]    = { .name = "Width",    .min = 0, .max = 127, .def = 127, .unit = kNT_unitNone },
     [kParam_BitDepth] = { .name = "Bit Depth",.min = 1, .max = 24, .def = 24, .unit = kNT_unitNone },
     [kParam_LoFiSR]   = { .name = "Lo-Fi SR", .min = 0, .max = 100, .def = 0, .unit = kNT_unitPercent },
+    [kParam_LoFiSmooth] = { .name = "Smoothing", .min = 0, .max = 100, .def = 0, .unit = kNT_unitPercent },
     [kParam_TapeSat]  = { .name = "Tape Sat", .min = 0, .max = 100, .def = 0, .unit = kNT_unitPercent },
 };
 
 // Parameter pages
 static const uint8_t page1[] = { kParam_DryInL, kParam_DryInR, kParam_FBInL, kParam_FBInR, kParam_ClockIn, kParam_OutL, kParam_OutL_Mode, kParam_OutR, kParam_OutR_Mode };
 static const uint8_t page2[] = { kParam_Freeze, kParam_Division, kParam_Triplet, kParam_Dotted, kParam_Crossfade, kParam_PingPong, kParam_LoopMode, kParam_Sync, kParam_MidiChannel, kParam_Tempo };
-static const uint8_t page3[] = { kParam_Feedback, kParam_Resonance, kParam_Base, kParam_Width, kParam_BitDepth, kParam_LoFiSR, kParam_TapeSat };
+static const uint8_t page3[] = { kParam_Feedback, kParam_Resonance, kParam_Base, kParam_Width, kParam_BitDepth, kParam_LoFiSR, kParam_LoFiSmooth, kParam_TapeSat };
 
 static const _NT_parameterPage pages[] = {
     { .name = "Routing & I/O", .numParams = ARRAY_SIZE(page1), .params = page1 },
@@ -258,32 +265,29 @@ static inline float applyHysteresis(float in, float& state, float amount) {
     // amount = 0 (transparent) to 1 (heavy smear)
     float target = saturate(in);
     // A simple one-pole lag mimics the 'lag' in magnetic alignment
-    float coeff = 0.5f + (0.45f * (1.0f - amount)); 
+    float coeff = 0.7f + (0.25f * (1.0f - amount)); 
     state = state + coeff * (target - state);
     return state;
 }
 
 // Helper: Tape Saturation Chain
-static inline float processTape(float x, float drive, float amount, TapeState& s, const float* hfCoeffs, const float* dcCoeffs) {
+static inline float processTape(float x, float drive, float amount, TapeState& s, const float* dcCoeffs) {
     // 1. DC Blocker (Essential to prevent bias from exploding the loop)
     float in = processBiquad(x, s.dcBlock, dcCoeffs);
     
     // 2. Add Asymmetrical Bias (Even harmonics/Warmth)
     // Small offset before saturation creates 'warm' even-order harmonics
-    float biased = (in * drive) + (0.03f * amount);
+    float biased = (in * drive) + (0.01f * amount);
 
     // 3. Hysteresis / Smear (Memory Effect)
     // s.lastPreSat acts as the 'magnetic memory'
     float saturated = applyHysteresis(biased, s.lastPreSat, amount);
 
     // 4. Subtract Bias to center signal before HF roll-off
-    saturated -= (0.02f * amount);
+    saturated -= (0.005f * amount);
 
-    // 5. High-Frequency Roll-off (Warmth)
-    float warmed = processBiquad(saturated, s.hfRollOff, hfCoeffs);
-
-    // 6. Unity-Gain Blend
-    return (x * (1.0f - amount)) + (warmed * amount);
+    // 5. Unity-Gain Blend
+    return (x * (1.0f - amount)) + (saturated * amount);
 }
 
 // Helper: Fast Random (LCG)
@@ -295,9 +299,16 @@ static inline float getNoise(uint32_t& state) {
 // Helper: Bit Crusher
 static inline float bitCrush(float x, int depth, uint32_t& rngState) {
     if (depth >= 24) return x;
-    float scale = (float)(1 << depth);
-    float dither = (getNoise(rngState) - getNoise(rngState)) / scale; // TPDF
-    return (float)((int)((x + dither) * scale)) / scale;
+    
+    // Calculate levels based on depth
+    float levels = powf(2.0f, (float)depth); 
+    float invLevels = 1.0f / levels;
+
+    // TPDF Dither to mask quantization distortion
+    float dither = (getNoise(rngState) - getNoise(rngState)) * invLevels;
+    
+    // Mid-tread quantization: ensures 0.0 stays 0.0
+    return roundf((x + dither) * levels) * invLevels;
 }
 
 // Helper: Calculate Biquad Coeffs (RBJ)
@@ -370,7 +381,7 @@ _NT_algorithm* construct(const _NT_algorithmMemoryPtrs& ptrs, const _NT_algorith
     alg->writeHead = 0;
     
     // Initialize defaults
-    alg->feedback = 1.0f;
+    alg->feedback = 1.0f; // 0dB
     alg->resonance = 0.0f;
     alg->freeze = false;
     alg->loopMode = 0;
@@ -418,6 +429,15 @@ _NT_algorithm* construct(const _NT_algorithmMemoryPtrs& ptrs, const _NT_algorith
     alg->rngState = 0x5EED;
     alg->reversePhase = 0.0f;
     alg->lastLoopMode = 0;
+    alg->lofiCounter = 0.0f;
+    alg->lastLofiSampleL = 0.0f;
+    alg->lastLofiSampleR = 0.0f;
+    alg->prevLofiSampleL = 0.0f;
+    alg->prevLofiSampleR = 0.0f;
+    alg->lofiPreFilterL = 0.0f;
+    alg->lofiPreFilterR = 0.0f;
+    alg->lofiSR = 0.0f;
+    alg->lofiSmooth = 0.0f;
     
     return (_NT_algorithm*)alg;
 }
@@ -441,15 +461,32 @@ void parameterChanged(_NT_algorithm* self, int p) {
         case kParam_Triplet: pThis->triplet = (int)self->v[p]; break;
         case kParam_Dotted: pThis->dotted = (self->v[p] > 0.5f); break;
         case kParam_Crossfade: pThis->crossfade = (float)self->v[p]; break;
-        case kParam_Feedback: pThis->feedback = self->v[p] / 100.0f; break;
-        case kParam_Resonance: pThis->resonance = self->v[p] / 100.0f; break;
+        case kParam_Feedback: 
+            if (self->v[p] <= -60) pThis->feedback = 0.0f; // True silence at min
+            else pThis->feedback = powf(10.0f, self->v[p] / 20.0f); 
+            break;
+        case kParam_Resonance: {
+            float val = self->v[p] / 100.0f;
+            pThis->resonance = val * val;
+            break;
+        }
         case kParam_PingPong: pThis->pingPong = (self->v[p] > 0.5f); break;
         case kParam_LoopMode: pThis->loopMode = (int)self->v[p]; break;
         case kParam_Sync:   pThis->sync = (int)self->v[p]; break;
         case kParam_MidiChannel: pThis->midiChannel = (int)self->v[p]; break;
         case kParam_Tempo:  pThis->tempo = (float)self->v[p]; break;
         case kParam_BitDepth: pThis->bitDepth = (int)self->v[p]; break;
-        case kParam_TapeSat: pThis->tapeSat = self->v[p] / 100.0f; break;
+        case kParam_TapeSat: {
+            float val = self->v[p] / 100.0f;
+            pThis->tapeSat = val * val;
+            break;
+        }
+        case kParam_LoFiSR: {
+            float val = self->v[p] / 100.0f;
+            pThis->lofiSR = val * val;
+            break;
+        }
+        case kParam_LoFiSmooth: pThis->lofiSmooth = self->v[p] / 100.0f; break;
         case kParam_Base: pThis->base = self->v[p] / 127.0f; break;
         case kParam_Width: pThis->width = self->v[p] / 127.0f; break;
         default: break;
@@ -541,38 +578,33 @@ void step(_NT_algorithm* self, float* busFrames, int numFramesBy4) {
     float fBase = 0.00025f * getLinearInterp(pThis->smoothedBase, kPow1000Table);
     float widthVal = pThis->smoothedBase + (pThis->smoothedWidth * (1.0f - pThis->smoothedBase));
     float fWidth = 0.00025f * getLinearInterp(widthVal, kPow1000Table);
+    
+    // Clamp Width to Tape HF Roll-off (12kHz) to combine filters
+    float sr = (float)NT_globals.sampleRate;
+    float maxFWidth = 12000.0f / sr;
+    if (fWidth > maxFWidth) fWidth = maxFWidth;
 
     calcFilterCoeffs(kFilterHPF, fBase, Q, hpfCoeffs);
     calcFilterCoeffs(kFilterLPF, fWidth, Q, lpfCoeffs);
     
-    float sr = (float)NT_globals.sampleRate;
     calcFilterCoeffs(kFilterHPF, 20.0f / sr, 0.707f, dcCoeffs);
 
     // Update Tape Coeffs if SR changed
     if (sr != pThis->lastSampleRate || pThis->tapeSat != pThis->lastTapeSat) {
         pThis->lastSampleRate = sr;
         pThis->lastTapeSat = pThis->tapeSat;
-        
-        // 1. HF Roll-off: 12000Hz, Q=0.707, LPF
-        float phaseHF = 4.0f * 12000.0f / sr;
-        float snHF = getSineInterp(phaseHF);
-        float csHF = getSineInterp(1.0f - phaseHF);
-        float alphaHF = snHF / (2.0f * 0.707f);
-        float a0HF = 1.0f + alphaHF;
-        float oneMinusCs = 1.0f - csHF;
-        pThis->hfRollOffCoeffs[0] = (oneMinusCs * 0.5f) / a0HF;
-        pThis->hfRollOffCoeffs[1] = oneMinusCs / a0HF;
-        pThis->hfRollOffCoeffs[2] = (oneMinusCs * 0.5f) / a0HF;
-        pThis->hfRollOffCoeffs[3] = (-2.0f * csHF) / a0HF;
-        pThis->hfRollOffCoeffs[4] = (1.0f - alphaHF) / a0HF;
     }
 
     // Limiter constants (Sample-rate independent)
     float lookAheadMs = 2.0f;
     uint32_t lookAheadSamples = (uint32_t)(sr * (lookAheadMs * 0.001f));
     float atkCoeff = 1.0f - expf(-1.0f / (sr * 0.001f)); // 1ms Attack
-    float relCoeff = 1.0f - expf(-1.0f / (sr * 0.050f)); // 50ms Release
-    const float kLimThreshold = 0.944f; // -0.5 dB
+    float relCoeff = 1.0f - expf(-1.0f / (sr * 0.020f)); // 20ms Release
+    const float kLimThreshold = 0.99f; // -0.1 dB
+
+    // Pre-calc Lo-Fi Smooth Gains (Equal Power)
+    float lofiGainZOH = getSineInterp(1.0f - pThis->lofiSmooth);
+    float lofiGainSmooth = getSineInterp(pThis->lofiSmooth);
 
     // Determine BPM
     float bpm = 120.0f;
@@ -732,6 +764,43 @@ void step(_NT_algorithm* self, float* busFrames, int numFramesBy4) {
         }
 
         // 3. Process Effects on the Wet Signal (Buffer Read)
+        // Sample Rate Reduction
+        // 1. Calculate Step Size (Frequency)
+        // Logarithmic mapping for "Frequency Ratio" feel
+        float lofiNorm = 1.0f - pThis->lofiSR;
+        float stepSize = getLinearInterp(lofiNorm, kPow1000Table) * 0.001f;
+
+        // Jitter: Add randomness to the clock rate
+        float jitter = (getNoise(pThis->rngState) - 0.5f) * 0.02f * stepSize;
+        stepSize += jitter;
+        
+        // 2. Adaptive Pre-Filter (One-pole LPF)
+        // Cutoff tracks the step size to prevent aliasing
+        float alpha = my_min(1.0f, stepSize * 3.0f);
+        pThis->lofiPreFilterL += alpha * (delayL - pThis->lofiPreFilterL);
+        pThis->lofiPreFilterR += alpha * (delayR - pThis->lofiPreFilterR);
+        
+        float inL = pThis->lofiPreFilterL;
+        float inR = pThis->lofiPreFilterR;
+
+        // 3. Floating-Point Accumulator
+        pThis->lofiCounter += stepSize;
+        if (pThis->lofiCounter >= 1.0f) {
+            pThis->lofiCounter -= 1.0f;
+            pThis->prevLofiSampleL = pThis->lastLofiSampleL;
+            pThis->prevLofiSampleR = pThis->lastLofiSampleR;
+            pThis->lastLofiSampleL = inL;
+            pThis->lastLofiSampleR = inR;
+        }
+
+        // 4. Output Generation (Stepped vs Smooth)
+        float t = pThis->lofiCounter;
+        float smoothL = pThis->prevLofiSampleL + (pThis->lastLofiSampleL - pThis->prevLofiSampleL) * t;
+        float smoothR = pThis->prevLofiSampleR + (pThis->lastLofiSampleR - pThis->prevLofiSampleR) * t;
+        
+        delayL = (pThis->lastLofiSampleL * lofiGainZOH) + (smoothL * lofiGainSmooth);
+        delayR = (pThis->lastLofiSampleR * lofiGainZOH) + (smoothR * lofiGainSmooth);
+
         // Bit Crush
         if (pThis->bitDepth < 24) {
             delayL = bitCrush(delayL, pThis->bitDepth, pThis->rngState);
@@ -749,21 +818,16 @@ void step(_NT_algorithm* self, float* busFrames, int numFramesBy4) {
         }
 
         // LPF Bypass Logic
-        float currentWidthVal = pThis->smoothedBase + (pThis->smoothedWidth * (1.0f - pThis->smoothedBase));
-        if (currentWidthVal >= 0.9999f) {
-            pThis->lpfStateL = {};
-            pThis->lpfStateR = {};
-        } else {
-            delayL = processBiquad(delayL, pThis->lpfStateL, lpfCoeffs);
-            delayR = processBiquad(delayR, pThis->lpfStateR, lpfCoeffs);
-        }
+        // Always run LPF because it now handles the Tape HF Roll-off (12kHz limit)
+        delayL = processBiquad(delayL, pThis->lpfStateL, lpfCoeffs);
+        delayR = processBiquad(delayR, pThis->lpfStateR, lpfCoeffs);
 
         // Tape Saturation (Always On)
         // Map the 0-100% parameter to 1.0 (clean) to 1.5 (warm/saturated)
         float tapeAmount = pThis->tapeSat; // 0.0 to 1.0
-        float drive = 1.0f + (tapeAmount * 0.5f);
-        delayL = processTape(delayL, drive, tapeAmount, pThis->tapeL, pThis->hfRollOffCoeffs, dcCoeffs);
-        delayR = processTape(delayR, drive, tapeAmount, pThis->tapeR, pThis->hfRollOffCoeffs, dcCoeffs);
+        float drive = 1.0f + (tapeAmount * 0.25f);
+        delayL = processTape(delayL, drive, tapeAmount, pThis->tapeL, dcCoeffs);
+        delayR = processTape(delayR, drive, tapeAmount, pThis->tapeR, dcCoeffs);
 
         // --- Transparent Look-Ahead Limiter ---
         // 1. Look-Ahead Detection
@@ -814,7 +878,7 @@ void step(_NT_algorithm* self, float* busFrames, int numFramesBy4) {
         if (fbInL) fbSourceL = fbInL[i];
         if (fbInR) fbSourceR = fbInR[i];
 
-        float fbVal = pThis->feedback * pThis->feedback; // Audio taper (squared)
+        float fbVal = pThis->feedback;
         
         // Fade feedback to 0% when recording (gainWet goes to 0)
         float currentFb = fbVal * gainWet;
@@ -851,11 +915,14 @@ bool draw(_NT_algorithm* self) {
     // 2. Feedback Display
     char buf[32];
     buf[0] = 'F'; buf[1] = 'B'; buf[2] = ':'; buf[3] = ' ';
-    int fb = (int)(pThis->feedback * 100.0f);
-    int len = NT_intToString(buf + 4, fb);
-    buf[4 + len] = '%';
-    buf[4 + len + 1] = 0;
-    NT_drawText(10, 25, buf);
+    int fb = pThis->v[kParam_Feedback];
+    if (fb <= -60) {
+        NT_drawText(10, 25, "FB: -inf");
+    } else {
+        int len = NT_intToString(buf + 4, fb);
+        buf[4 + len] = 'd'; buf[4 + len + 1] = 'B'; buf[4 + len + 2] = 0;
+        NT_drawText(10, 25, buf);
+    }
 
     // 3. BPM Display
     float currentBpm = pThis->tempo;
@@ -897,11 +964,11 @@ bool draw(_NT_algorithm* self) {
     }
 
     // 6. Limiter Activity Bar
-    // Draw a small red bar at the top if the limiter is reducing gain
-    if (pThis->limiterGain < 0.99f) {
+    // Draw a small red bar at the bottom if the limiter is reducing gain
+    if (pThis->limiterGain < 0.999f) {
         int barWidth = (int)((1.0f - pThis->limiterGain) * 255.0f * 2.0f); // Exaggerate for visibility
         if (barWidth > 255) barWidth = 255;
-        NT_drawShapeI(kNT_line, 0, 33, barWidth, 33, 10); // Red/Bright line at top
+        NT_drawShapeI(kNT_line, 0, 62, barWidth, 62, 10); // Red/Bright line at bottom
     }
 
     return false;
