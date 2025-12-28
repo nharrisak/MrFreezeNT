@@ -14,6 +14,17 @@ struct TapeState {
     float lastPreSat;
 };
 
+// Diffusion Constants (Primes approx 20ms and 7ms at 96kHz)
+static const int kApdSize1 = 1931;
+static const int kApdSize2 = 677;
+static const int kTotalApdSize = (kApdSize1 + kApdSize2) * 2;
+
+struct AllPassState {
+    float* buffer;
+    int size;
+    int head;
+};
+
 struct MrFreezeAlgorithm : public _NT_algorithm {
     float* audioBuffer;
 
@@ -40,6 +51,7 @@ struct MrFreezeAlgorithm : public _NT_algorithm {
     float tapeSat;
     float lofiSR;
     float lofiSmooth;
+    float diffusion;
 
     // State
     uint32_t bufferSize;
@@ -85,6 +97,10 @@ struct MrFreezeAlgorithm : public _NT_algorithm {
     float prevLofiSampleR;
     float lofiPreFilterL;
     float lofiPreFilterR;
+    
+    // Diffusion State
+    AllPassState apd1L, apd2L, apd1R, apd2R;
+    float apdLfoPhase;
 };
 
 // Parameter indices
@@ -116,6 +132,7 @@ enum {
     kParam_LoFiSR,
     kParam_LoFiSmooth,
     kParam_TapeSat,
+    kParam_Diffusion,
     kNumParameters
 };
 
@@ -168,12 +185,13 @@ static const _NT_parameter parameters[] = {
     [kParam_LoFiSR]   = { .name = "Lo-Fi SR", .min = 0, .max = 100, .def = 0, .unit = kNT_unitPercent },
     [kParam_LoFiSmooth] = { .name = "Smoothing", .min = 0, .max = 100, .def = 0, .unit = kNT_unitPercent },
     [kParam_TapeSat]  = { .name = "Tape Sat", .min = 0, .max = 100, .def = 0, .unit = kNT_unitPercent },
+    [kParam_Diffusion]= { .name = "Diffusion",.min = 0, .max = 100, .def = 0, .unit = kNT_unitPercent },
 };
 
 // Parameter pages
 static const uint8_t page1[] = { kParam_DryInL, kParam_DryInR, kParam_FBInL, kParam_FBInR, kParam_ClockIn, kParam_OutL, kParam_OutL_Mode, kParam_OutR, kParam_OutR_Mode };
 static const uint8_t page2[] = { kParam_Freeze, kParam_Division, kParam_Triplet, kParam_Dotted, kParam_Crossfade, kParam_PingPong, kParam_LoopMode, kParam_Sync, kParam_MidiChannel, kParam_Tempo };
-static const uint8_t page3[] = { kParam_Feedback, kParam_Resonance, kParam_Base, kParam_Width, kParam_BitDepth, kParam_LoFiSR, kParam_LoFiSmooth, kParam_TapeSat };
+static const uint8_t page3[] = { kParam_Feedback, kParam_Resonance, kParam_Base, kParam_Width, kParam_BitDepth, kParam_LoFiSR, kParam_LoFiSmooth, kParam_TapeSat, kParam_Diffusion };
 
 static const _NT_parameterPage pages[] = {
     { .name = "Routing & I/O", .numParams = ARRAY_SIZE(page1), .params = page1 },
@@ -290,6 +308,52 @@ static inline float processTape(float x, float drive, float amount, TapeState& s
     return (x * (1.0f - amount)) + (saturated * amount);
 }
 
+// Helper: All-Pass Diffuser
+static inline float processAllPass(float x, AllPassState& ap, float mod) {
+    const float g = 0.5f;
+    // Modulated delay length (approx full buffer size minus margin)
+    float d = (float)ap.size - 15.0f + mod; 
+    
+    float r = (float)ap.head - d;
+    while (r < 0.0f) r += (float)ap.size;
+    
+    int i = (int)r;
+    int j = i + 1; if (j >= ap.size) j = 0;
+    float f = r - (float)i;
+    
+    float delayed = ap.buffer[i] * (1.0f - f) + ap.buffer[j] * f;
+    float w = x + g * delayed;
+    float y = -g * w + delayed;
+    
+    ap.buffer[ap.head++] = w;
+    if (ap.head >= ap.size) ap.head = 0;
+    return y;
+}
+
+// Helper: Nested All-Pass Diffuser (True Nesting)
+static inline float processNestedAllPass(float x, AllPassState& outer, AllPassState& inner, float modOuter, float modInner) {
+    const float g = 0.5f;
+    // Modulated delay length for outer
+    float d = (float)outer.size - 15.0f + modOuter; 
+    
+    float r = (float)outer.head - d;
+    while (r < 0.0f) r += (float)outer.size;
+    
+    int i = (int)r;
+    int j = i + 1; if (j >= outer.size) j = 0;
+    float f = r - (float)i;
+    
+    float delayed = outer.buffer[i] * (1.0f - f) + outer.buffer[j] * f;
+    float feedback = processAllPass(delayed, inner, modInner);
+    
+    float w = x + g * feedback;
+    float y = -g * w + feedback;
+    
+    outer.buffer[outer.head++] = w;
+    if (outer.head >= outer.size) outer.head = 0;
+    return y;
+}
+
 // Helper: Fast Random (LCG)
 static inline float getNoise(uint32_t& state) {
     state = state * 1664525 + 1013904223;
@@ -362,7 +426,7 @@ void calculateRequirements(_NT_algorithmRequirements& req, const int32_t* specif
     // Calculate DRAM based on Max Delay Time (spec 0)
     // Assuming 96kHz sample rate for safety, stereo (2 channels), float (4 bytes)
     int maxTime = specifications ? specifications[kSpec_MaxDelayTime] : 10;
-    req.dram = maxTime * 96000 * 2 * sizeof(float);
+    req.dram = (maxTime * 96000 * 2 + kTotalApdSize) * sizeof(float);
     
     req.dtc = 0;
     req.itc = 0;
@@ -438,6 +502,18 @@ _NT_algorithm* construct(const _NT_algorithmMemoryPtrs& ptrs, const _NT_algorith
     alg->lofiPreFilterR = 0.0f;
     alg->lofiSR = 0.0f;
     alg->lofiSmooth = 0.0f;
+    alg->diffusion = 0.0f;
+    alg->apdLfoPhase = 0.0f;
+
+    // Setup APD Pointers (at end of main buffer)
+    float* apdBase = alg->audioBuffer + (maxTime * 96000 * 2);
+    alg->apd1L.buffer = apdBase; alg->apd1L.size = kApdSize1; alg->apd1L.head = 0;
+    apdBase += kApdSize1;
+    alg->apd2L.buffer = apdBase; alg->apd2L.size = kApdSize2; alg->apd2L.head = 0;
+    apdBase += kApdSize2;
+    alg->apd1R.buffer = apdBase; alg->apd1R.size = kApdSize1; alg->apd1R.head = 0;
+    apdBase += kApdSize1;
+    alg->apd2R.buffer = apdBase; alg->apd2R.size = kApdSize2; alg->apd2R.head = 0;
     
     return (_NT_algorithm*)alg;
 }
@@ -489,6 +565,7 @@ void parameterChanged(_NT_algorithm* self, int p) {
         case kParam_LoFiSmooth: pThis->lofiSmooth = self->v[p] / 100.0f; break;
         case kParam_Base: pThis->base = self->v[p] / 127.0f; break;
         case kParam_Width: pThis->width = self->v[p] / 127.0f; break;
+        case kParam_Diffusion: pThis->diffusion = self->v[p] / 100.0f; break;
         default: break;
     }
 }
@@ -828,6 +905,31 @@ void step(_NT_algorithm* self, float* busFrames, int numFramesBy4) {
         float drive = 1.0f + (tapeAmount * 0.25f);
         delayL = processTape(delayL, drive, tapeAmount, pThis->tapeL, dcCoeffs);
         delayR = processTape(delayR, drive, tapeAmount, pThis->tapeR, dcCoeffs);
+
+        // Diffusion (Nested All-Pass)
+        if (pThis->diffusion > 0.0f) {
+            // Slow LFO for modulation (approx 0.2Hz)
+            pThis->apdLfoPhase += 0.000013f; 
+            if (pThis->apdLfoPhase > 6.283f) pThis->apdLfoPhase -= 6.283f;
+
+            float p = pThis->apdLfoPhase * 0.63661977f; // 2/pi
+            float sineVal;
+            if (p <= 1.0f) sineVal = getSineInterp(p);
+            else if (p <= 2.0f) sineVal = getSineInterp(2.0f - p);
+            else if (p <= 3.0f) sineVal = -getSineInterp(p - 2.0f);
+            else sineVal = -getSineInterp(4.0f - p);
+            float mod = sineVal * 10.0f; // +/- 10 samples
+
+            float diffL = processNestedAllPass(delayL, pThis->apd1L, pThis->apd2L, mod, -mod);
+            float diffR = processNestedAllPass(delayR, pThis->apd1R, pThis->apd2R, mod * 0.7f, -mod * 0.7f);
+
+            // 5% Cross-feed
+            float cfL = diffL + 0.05f * diffR;
+            float cfR = diffR + 0.05f * diffL;
+
+            delayL = (delayL * (1.0f - pThis->diffusion)) + (cfL * pThis->diffusion);
+            delayR = (delayR * (1.0f - pThis->diffusion)) + (cfR * pThis->diffusion);
+        }
 
         // --- Transparent Look-Ahead Limiter ---
         // 1. Look-Ahead Detection
