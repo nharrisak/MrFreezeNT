@@ -4,6 +4,10 @@
 #include <cstring>
 #include <math.h>
 
+#ifndef M_PI
+#define M_PI 3.14159265358979323846f
+#endif
+
 // Algorithm state
 struct BiquadState {
     float x1, x2, y1, y2;
@@ -15,8 +19,8 @@ struct TapeState {
 };
 
 // Diffusion Constants (Primes approx 20ms and 7ms at 96kHz)
-static const int kApdSize1 = 1931;
-static const int kApdSize2 = 677;
+static const int kApdSize1 = 3559;
+static const int kApdSize2 = 337;
 static const int kTotalApdSize = (kApdSize1 + kApdSize2) * 2;
 
 struct AllPassState {
@@ -47,6 +51,7 @@ struct MrFreezeAlgorithm : public _NT_algorithm {
     float feedback;
     float resonance;
     float base, width;
+    float tone;
     int bitDepth;
     float tapeSat;
     float lofiSR;
@@ -57,8 +62,10 @@ struct MrFreezeAlgorithm : public _NT_algorithm {
     // State
     uint32_t bufferSize;
     uint32_t writeHead;
+    uint32_t freezeAnchor;
     BiquadState lpfStateL, lpfStateR;
     BiquadState hpfStateL, hpfStateR;
+    BiquadState tiltStateL, tiltStateR;
 
     // Clock State
     float lastClockSample;
@@ -84,6 +91,7 @@ struct MrFreezeAlgorithm : public _NT_algorithm {
     float lastTapeSat;
     float smoothedBase;
     float smoothedWidth;
+    float smoothedTone;
     float smoothedDelayLen;
     float fadeTargetLen;
     float fadeOldLen;
@@ -104,6 +112,8 @@ struct MrFreezeAlgorithm : public _NT_algorithm {
     int driftUpdateCounter;
     float currentDriftDelay;
     float currentDriftWidth;
+    float currentDriftBase;
+    float currentDriftTone;
     float currentDriftLofi;
     float currentDriftDiff;
     float currentDriftFeedback;
@@ -141,6 +151,7 @@ enum {
     kParam_Resonance,
     kParam_Base,
     kParam_Width,
+    kParam_Tone,
     kParam_BitDepth,
     kParam_LoFiSR,
     kParam_LoFiSmooth,
@@ -195,6 +206,7 @@ static const _NT_parameter parameters[] = {
     [kParam_Resonance]= { .name = "Resonance",.min = 0, .max = 100, .def = 0, .unit = kNT_unitPercent },
     [kParam_Base]     = { .name = "Base",     .min = 0, .max = 127, .def = 0, .unit = kNT_unitNone },
     [kParam_Width]    = { .name = "Width",    .min = 0, .max = 127, .def = 127, .unit = kNT_unitNone },
+    [kParam_Tone]     = { .name = "Tone",     .min = 0, .max = 100, .def = 50, .unit = kNT_unitPercent },
     [kParam_BitDepth] = { .name = "Bit Depth",.min = 1, .max = 24, .def = 24, .unit = kNT_unitNone },
     [kParam_LoFiSR]   = { .name = "Lo-Fi SR", .min = 0, .max = 100, .def = 0, .unit = kNT_unitPercent },
     [kParam_LoFiSmooth] = { .name = "Smoothing", .min = 0, .max = 100, .def = 0, .unit = kNT_unitPercent },
@@ -206,7 +218,7 @@ static const _NT_parameter parameters[] = {
 // Parameter pages
 static const uint8_t page1[] = { kParam_DryInL, kParam_DryInR, kParam_FBInL, kParam_FBInR, kParam_ClockIn, kParam_OutL, kParam_OutL_Mode, kParam_OutR, kParam_OutR_Mode };
 static const uint8_t page2[] = { kParam_Freeze, kParam_Division, kParam_Triplet, kParam_Dotted, kParam_Crossfade, kParam_PingPong, kParam_LoopMode, kParam_Sync, kParam_MidiChannel, kParam_Tempo };
-static const uint8_t page3[] = { kParam_Feedback, kParam_Resonance, kParam_Base, kParam_Width, kParam_BitDepth, kParam_LoFiSR, kParam_LoFiSmooth, kParam_TapeSat, kParam_Diffusion, kParam_Drift };
+static const uint8_t page3[] = { kParam_Feedback, kParam_Resonance, kParam_Base, kParam_Width, kParam_Tone, kParam_BitDepth, kParam_LoFiSR, kParam_LoFiSmooth, kParam_TapeSat, kParam_Diffusion, kParam_Drift };
 
 static const _NT_parameterPage pages[] = {
     { .name = "Routing & I/O", .numParams = ARRAY_SIZE(page1), .params = page1 },
@@ -324,10 +336,9 @@ static inline float processTape(float x, float drive, float amount, TapeState& s
 }
 
 // Helper: All-Pass Diffuser
-static inline float processAllPass(float x, AllPassState& ap, float mod) {
-    const float g = 0.5f;
+static inline float processAllPass(float x, AllPassState& ap, float mod, float g) {
     // Modulated delay length (approx full buffer size minus margin)
-    float d = (float)ap.size - 15.0f + mod; 
+    float d = (float)ap.size - 25.0f + mod; 
     
     float r = (float)ap.head - d;
     while (r < 0.0f) r += (float)ap.size;
@@ -346,10 +357,9 @@ static inline float processAllPass(float x, AllPassState& ap, float mod) {
 }
 
 // Helper: Nested All-Pass Diffuser (True Nesting)
-static inline float processNestedAllPass(float x, AllPassState& outer, AllPassState& inner, float modOuter, float modInner) {
-    const float g = 0.5f;
+static inline float processNestedAllPass(float x, AllPassState& outer, AllPassState& inner, float modOuter, float modInner, float g) {
     // Modulated delay length for outer
-    float d = (float)outer.size - 15.0f + modOuter; 
+    float d = (float)outer.size - 25.0f + modOuter; 
     
     float r = (float)outer.head - d;
     while (r < 0.0f) r += (float)outer.size;
@@ -359,7 +369,7 @@ static inline float processNestedAllPass(float x, AllPassState& outer, AllPassSt
     float f = r - (float)i;
     
     float delayed = outer.buffer[i] * (1.0f - f) + outer.buffer[j] * f;
-    float feedback = processAllPass(delayed, inner, modInner);
+    float feedback = processAllPass(delayed, inner, modInner, g);
     
     float w = x + g * feedback;
     float y = -g * w + feedback;
@@ -432,6 +442,26 @@ static void calcFilterCoeffs(int type, float fNorm, float Q, float* c) {
     }
 }
 
+static void calcTiltCoeffs(float tone, float sr, float* c) {
+    // tone is 0.0 (dark) to 1.0 (bright)
+    float gain = (tone - 0.5f) * 2.0f; // -1.0 to 1.0
+    float omega = 2.0f * M_PI * 1000.0f / sr;
+    float sn = sinf(omega);
+    float cs = cosf(omega);
+    
+    // Simplified shelving logic
+    float A = powf(10.0f, (gain * 6.0f) / 40.0f); 
+    float beta = sqrtf(A) / 0.707f;
+
+    // Standard High-Shelf Coeffs (acts as tilt when centered)
+    float a0 = (A + 1.0f) + (A - 1.0f) * cs + beta * sn;
+    c[0] = (A * ((A + 1.0f) + (A - 1.0f) * cs + beta * sn)) / a0;
+    c[1] = (-2.0f * A * ((A - 1.0f) + (A + 1.0f) * cs)) / a0;
+    c[2] = (A * ((A + 1.0f) + (A - 1.0f) * cs - beta * sn)) / a0;
+    c[3] = (-2.0f * ((A - 1.0f) + (A + 1.0f) * cs)) / a0;
+    c[4] = ((A + 1.0f) - (A - 1.0f) * cs - beta * sn) / a0;
+}
+
 // --- Core Functions ---
 
 void calculateRequirements(_NT_algorithmRequirements& req, const int32_t* specifications) {
@@ -458,6 +488,7 @@ _NT_algorithm* construct(const _NT_algorithmMemoryPtrs& ptrs, const _NT_algorith
     int maxTime = specifications ? specifications[kSpec_MaxDelayTime] : 10;
     alg->bufferSize = maxTime * 96000; // Stereo frames
     alg->writeHead = 0;
+    alg->freezeAnchor = 0;
     
     // Initialize defaults
     alg->feedback = 1.0f; // 0dB
@@ -467,6 +498,7 @@ _NT_algorithm* construct(const _NT_algorithmMemoryPtrs& ptrs, const _NT_algorith
     alg->bitDepth = 24;
     alg->base = 0.0f;
     alg->width = 1.0f;
+    alg->tone = 0.5f;
     alg->dryInL = 0;
     alg->dryInR = 1;
     alg->outL = 13;
@@ -492,6 +524,8 @@ _NT_algorithm* construct(const _NT_algorithmMemoryPtrs& ptrs, const _NT_algorith
     alg->lpfStateR = {};
     alg->hpfStateL = {};
     alg->hpfStateR = {};
+    alg->tiltStateL = {};
+    alg->tiltStateR = {};
     
     // Init Tape State
     alg->tapeL = {};
@@ -500,6 +534,7 @@ _NT_algorithm* construct(const _NT_algorithmMemoryPtrs& ptrs, const _NT_algorith
     alg->lastTapeSat = -1.0f;
     alg->smoothedBase = 0.0f;
     alg->smoothedWidth = 1.0f;
+    alg->smoothedTone = 0.5f;
     alg->smoothedDelayLen = 48000.0f;
     alg->fadeTargetLen = 48000.0f;
     alg->fadeOldLen = 48000.0f;
@@ -524,6 +559,8 @@ _NT_algorithm* construct(const _NT_algorithmMemoryPtrs& ptrs, const _NT_algorith
     alg->driftUpdateCounter = 0;
     alg->currentDriftDelay = 0.0f;
     alg->currentDriftWidth = 0.0f;
+    alg->currentDriftBase = 0.0f;
+    alg->currentDriftTone = 0.0f;
     alg->currentDriftLofi = 0.0f;
     alg->currentDriftDiff = 0.0f;
     alg->currentDriftFeedback = 0.0f;
@@ -592,7 +629,12 @@ void parameterChanged(_NT_algorithm* self, int p) {
         case kParam_LoFiSmooth: pThis->lofiSmooth = self->v[p] / 100.0f; break;
         case kParam_Base: pThis->base = self->v[p] / 127.0f; break;
         case kParam_Width: pThis->width = self->v[p] / 127.0f; break;
-        case kParam_Diffusion: pThis->diffusion = self->v[p] / 100.0f; break;
+        case kParam_Tone: pThis->tone = self->v[p] / 100.0f; break;
+        case kParam_Diffusion: {
+            float val = self->v[p] / 100.0f;
+            pThis->diffusion = val * val;
+            break;
+        }
         case kParam_Drift: pThis->drift = self->v[p] / 100.0f; break;
         default: break;
     }
@@ -678,6 +720,9 @@ void step(_NT_algorithm* self, float* busFrames, int numFramesBy4) {
     float hpfCoeffs[5], lpfCoeffs[5], dcCoeffs[5];
     float Q = 0.707f * getLinearInterp(pThis->resonance, kPow20Table); // Logarithmic Q from 0.7 to ~14
     
+    float tiltCoeffs[5];
+    calcTiltCoeffs(pThis->smoothedTone, (float)NT_globals.sampleRate, tiltCoeffs);
+
     // Map Base (0-1) to Freq Norm (20Hz - 20kHz approx)
     // Logarithmic mapping: f = f_min * (ratio)^val
     float fBase = 0.00025f * getLinearInterp(pThis->smoothedBase, kPow1000Table);
@@ -771,7 +816,7 @@ void step(_NT_algorithm* self, float* busFrames, int numFramesBy4) {
 
     // Handle Freeze Transition
     if (pThis->freeze && !pThis->wasFrozen) {
-        // No special state reset needed for continuous tape model
+        pThis->freezeAnchor = pThis->writeHead;
     }
     pThis->wasFrozen = pThis->freeze;
 
@@ -783,21 +828,21 @@ void step(_NT_algorithm* self, float* busFrames, int numFramesBy4) {
         float driftAmount = pThis->drift;
         if (driftAmount > 0.0f) {
             // Rate scales with drift amount (higher = faster movement)
-            float rate = 0.0005f + (driftAmount * 0.005f); 
+            float rate = 0.002f + (driftAmount * 0.01f); 
             
             // Update Filtered Noise (L/R decorrelated)
             float rawL = (getNoise(pThis->rngState) - 0.5f) * 2.0f;
             float rawR = (getNoise(pThis->rngState) - 0.5f) * 2.0f;
             
-            // Correlate: Mix 50% of L into R for cohesion (simulating shared PSU sag)
+            // Correlate: Mix 20% of L into R for cohesion (simulating shared PSU sag)
             float nL = rawL;
-            float nR = (rawR * 0.5f) + (rawL * 0.5f);
+            float nR = (rawR * 0.8f) + (rawL * 0.2f);
             
             pThis->driftNoiseL += (nL - pThis->driftNoiseL) * rate;
             pThis->driftNoiseR += (nR - pThis->driftNoiseR) * rate;
             
-            // 1. Delay Length (High Sensitivity): Scale with delay length (~0.2% max)
-            pThis->currentDriftDelay = pThis->driftNoiseL * driftAmount * pThis->smoothedDelayLen * 0.002f; 
+            // 1. Delay Length (High Sensitivity): Scale with delay length (~0.5% max)
+            pThis->currentDriftDelay = pThis->driftNoiseL * driftAmount * pThis->smoothedDelayLen * 0.005f; 
             
             // 2. Width (Medium Sensitivity): Only if not at default (1.0)
             if (pThis->width < 0.99f) {
@@ -805,8 +850,14 @@ void step(_NT_algorithm* self, float* busFrames, int numFramesBy4) {
             } else {
                 pThis->currentDriftWidth = 0.0f;
             }
+
+            // 3. Base (Medium Sensitivity)
+            pThis->currentDriftBase = pThis->driftNoiseR * driftAmount * 0.1f;
             
-            // 3. Lo-Fi SR & Diffusion (Low Sensitivity)
+            // Tone (Medium Sensitivity)
+            pThis->currentDriftTone = pThis->driftNoiseR * driftAmount * 0.1f;
+            
+            // 4. Lo-Fi SR & Diffusion (Low Sensitivity)
             if (pThis->lofiSR > 0.01f) pThis->currentDriftLofi = pThis->driftNoiseL * pThis->lofiSR * driftAmount * 0.2f;
             else pThis->currentDriftLofi = 0.0f;
             
@@ -819,6 +870,8 @@ void step(_NT_algorithm* self, float* busFrames, int numFramesBy4) {
         } else {
             pThis->currentDriftDelay = 0.0f;
             pThis->currentDriftWidth = 0.0f;
+            pThis->currentDriftBase = 0.0f;
+            pThis->currentDriftTone = 0.0f;
             pThis->currentDriftLofi = 0.0f;
             pThis->currentDriftDiff = 0.0f;
             pThis->currentDriftFeedback = 0.0f;
@@ -840,19 +893,29 @@ void step(_NT_algorithm* self, float* busFrames, int numFramesBy4) {
         }
 
         // Smoothing
-        const float kParamSlew = 0.002f;
-        pThis->smoothedBase += (pThis->base - pThis->smoothedBase) * kParamSlew;
+        float currentSlew = 0.002f;
+        if (pThis->drift > 0.0f) {
+            // Modulate slew rate: +/- 50% at max drift to mimic organic component lag
+            currentSlew *= (1.0f + (pThis->driftNoiseL * pThis->drift * 0.5f));
+            if (currentSlew < 0.0005f) currentSlew = 0.0005f;
+        }
+
+        float targetBase = my_max(0.0f, my_min(1.0f, pThis->base + pThis->currentDriftBase));
+        pThis->smoothedBase += (targetBase - pThis->smoothedBase) * currentSlew;
         float targetWidth = my_max(0.0f, my_min(1.0f, pThis->width + pThis->currentDriftWidth));
-        pThis->smoothedWidth += (targetWidth - pThis->smoothedWidth) * kParamSlew;
+        pThis->smoothedWidth += (targetWidth - pThis->smoothedWidth) * currentSlew;
+        
+        float targetTone = my_max(0.0f, my_min(1.0f, pThis->tone + pThis->currentDriftTone));
+        pThis->smoothedTone += (targetTone - pThis->smoothedTone) * currentSlew;
         
         float targetLofi = my_max(0.0f, my_min(1.0f, pThis->lofiSR + pThis->currentDriftLofi));
-        pThis->smoothedLofiSR += (targetLofi - pThis->smoothedLofiSR) * kParamSlew;
+        pThis->smoothedLofiSR += (targetLofi - pThis->smoothedLofiSR) * currentSlew;
         
         float targetDiff = my_max(0.0f, my_min(1.0f, pThis->diffusion + pThis->currentDriftDiff));
-        pThis->smoothedDiffusion += (targetDiff - pThis->smoothedDiffusion) * kParamSlew;
+        pThis->smoothedDiffusion += (targetDiff - pThis->smoothedDiffusion) * currentSlew;
 
         float targetFb = my_max(0.0f, pThis->feedback + pThis->currentDriftFeedback);
-        pThis->smoothedFeedback += (targetFb - pThis->smoothedFeedback) * kParamSlew;
+        pThis->smoothedFeedback += (targetFb - pThis->smoothedFeedback) * currentSlew;
 
         // 1. Detect Macro Jumps (e.g., changing divisions)
         float targetLen = (float)pThis->currentDelayLen;
@@ -878,18 +941,58 @@ void step(_NT_algorithm* self, float* busFrames, int numFramesBy4) {
         pThis->smoothedDelayLen += ((pThis->fadeTargetLen + pThis->currentDriftDelay) - pThis->smoothedDelayLen) * 0.001f;
 
         // 3. Read Main Tap (Tap A)
-        float readPos = 0.0f;
-        
-        if (pThis->loopMode == 1) { // Reverse
-            pThis->reversePhase += 2.0f;
-            while (pThis->reversePhase >= pThis->smoothedDelayLen) {
-                pThis->reversePhase -= pThis->smoothedDelayLen;
-            }
-            readPos = (float)pThis->writeHead - pThis->reversePhase;
-        } else {
-            pThis->reversePhase = 0.0f;
-            readPos = (float)pThis->writeHead - pThis->smoothedDelayLen;
+        float L = pThis->smoothedDelayLen;
+        float doubleL = L * 2.0f;
+
+        // 1. Calculate Speed (with Drift)
+        float phaseSpeed = 1.0f;
+        if (pThis->drift > 0.0f) {
+            // Modulate speed with drift noise (approx +/- 1%)
+            phaseSpeed += pThis->driftNoiseL * pThis->drift * 0.01f;
         }
+
+        // 2. Increment Phase
+        pThis->reversePhase += phaseSpeed;
+
+        // 3. Wrap Phase
+        if (pThis->loopMode == 2) { // Ping-Pong
+            while (pThis->reversePhase >= doubleL) pThis->reversePhase -= doubleL;
+            if (pThis->reversePhase < 0.0f) pThis->reversePhase += doubleL;
+        } else { // Fwd or Rev
+            while (pThis->reversePhase >= L) pThis->reversePhase -= L;
+            if (pThis->reversePhase < 0.0f) pThis->reversePhase += L;
+        }
+
+        // 4. Map to Offset
+        float pingPongOffset = pThis->reversePhase;
+        float secondaryOffset = -9999.0f; // Flag for no secondary
+        float bounceFade = 0.0f;
+        float fadeLen = my_min(192.0f, L * 0.4f); // ~2ms fade, capped for short loops
+
+        if (pThis->loopMode == 2) { // Ping-Pong
+            // Top Turnaround (L)
+            if (pThis->reversePhase >= L && pThis->reversePhase < L + fadeLen) {
+                pingPongOffset = doubleL - pThis->reversePhase; // Main (Reverse)
+                secondaryOffset = pThis->reversePhase;          // Secondary (Forward Overshoot)
+                bounceFade = (pThis->reversePhase - L) / fadeLen; // 0 (Old) -> 1 (New)
+            }
+            // Bottom Turnaround (0)
+            else if (pThis->reversePhase < fadeLen) {
+                pingPongOffset = pThis->reversePhase;           // Main (Forward)
+                secondaryOffset = -pThis->reversePhase;         // Secondary (Reverse Overshoot)
+                bounceFade = pThis->reversePhase / fadeLen;       // 0 (Old) -> 1 (New)
+            }
+            else if (pingPongOffset > L) {
+                pingPongOffset = doubleL - pingPongOffset; // L -> 0
+            }
+        } else if (pThis->loopMode == 1) { // Reverse
+            pingPongOffset = L - pThis->reversePhase; // L -> 0
+        }
+        // Mode 0 (Fwd): pingPongOffset = reversePhase (0 -> L)
+
+        // 5. Calculate Read Position (Anchor is static when Frozen)
+        float anchor = (float)(pThis->freeze ? pThis->freezeAnchor : pThis->writeHead);
+        float readPos = anchor - L + pingPongOffset;
 
         while (readPos < 0.0f) readPos += (float)pThis->bufferSize;
         while (readPos >= (float)pThis->bufferSize) readPos -= (float)pThis->bufferSize;
@@ -902,6 +1005,28 @@ void step(_NT_algorithm* self, float* busFrames, int numFramesBy4) {
                        pThis->audioBuffer[idxB * 2] * fraction;
         float delayR = pThis->audioBuffer[idxA * 2 + 1] * (1.0f - fraction) + 
                        pThis->audioBuffer[idxB * 2 + 1] * fraction;
+
+        // Apply Bounce Crossfade if active
+        if (secondaryOffset > -9000.0f) {
+            float readPos2 = anchor - L + secondaryOffset;
+            while (readPos2 < 0.0f) readPos2 += (float)pThis->bufferSize;
+            while (readPos2 >= (float)pThis->bufferSize) readPos2 -= (float)pThis->bufferSize;
+
+            uint32_t idxA2 = (uint32_t)readPos2;
+            uint32_t idxB2 = (idxA2 + 1) % pThis->bufferSize;
+            float fraction2 = readPos2 - (float)idxA2;
+
+            float delayL2 = pThis->audioBuffer[idxA2 * 2] * (1.0f - fraction2) + 
+                            pThis->audioBuffer[idxB2 * 2] * fraction2;
+            float delayR2 = pThis->audioBuffer[idxA2 * 2 + 1] * (1.0f - fraction2) + 
+                            pThis->audioBuffer[idxB2 * 2 + 1] * fraction2;
+
+            float gMain = getSineInterp(bounceFade);
+            float gSec = getSineInterp(1.0f - bounceFade);
+
+            delayL = (delayL * gMain) + (delayL2 * gSec);
+            delayR = (delayR * gMain) + (delayR2 * gSec);
+        }
 
         // 4. Clean Crossfade for Jumps
         if (pThis->fadePhase < 1.0f) {
@@ -974,6 +1099,10 @@ void step(_NT_algorithm* self, float* busFrames, int numFramesBy4) {
             delayR = bitCrush(delayR, pThis->bitDepth, pThis->rngState);
         }
 
+        // Tilt EQ
+        delayL = processBiquad(delayL, pThis->tiltStateL, tiltCoeffs);
+        delayR = processBiquad(delayR, pThis->tiltStateR, tiltCoeffs);
+
         // Filters (Base/Width)
         // HPF Bypass Logic
         if (pThis->smoothedBase <= 0.0001f) {
@@ -1008,10 +1137,18 @@ void step(_NT_algorithm* self, float* busFrames, int numFramesBy4) {
             else if (p <= 2.0f) sineVal = getSineInterp(2.0f - p);
             else if (p <= 3.0f) sineVal = -getSineInterp(p - 2.0f);
             else sineVal = -getSineInterp(4.0f - p);
-            float mod = sineVal * 10.0f; // +/- 10 samples
+            float mod = sineVal * 20.0f; // +/- 20 samples
 
-            float diffL = processNestedAllPass(delayL, pThis->apd1L, pThis->apd2L, mod, -mod);
-            float diffR = processNestedAllPass(delayR, pThis->apd1R, pThis->apd2R, mod * 0.7f, -mod * 0.7f);
+            // Calculate modulated gain
+            float apGain = 0.5f;
+            if (pThis->drift > 0.0f) {
+                // Fluctuate between 0.25 and 0.5 based on drift noise
+                float targetG = 0.375f + (pThis->driftNoiseL * 0.125f);
+                apGain = (0.5f * (1.0f - pThis->drift)) + (targetG * pThis->drift);
+            }
+
+            float diffL = processNestedAllPass(delayL, pThis->apd1L, pThis->apd2L, mod, -mod, apGain);
+            float diffR = processNestedAllPass(delayR, pThis->apd1R, pThis->apd2R, mod * 0.7f, -mod * 0.7f, apGain);
 
             // 5% Cross-feed
             float cfL = diffL + 0.05f * diffR;
