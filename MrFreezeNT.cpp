@@ -52,6 +52,7 @@ struct MrFreezeAlgorithm : public _NT_algorithm {
     float lofiSR;
     float lofiSmooth;
     float diffusion;
+    float drift;
 
     // State
     uint32_t bufferSize;
@@ -98,6 +99,18 @@ struct MrFreezeAlgorithm : public _NT_algorithm {
     float lofiPreFilterL;
     float lofiPreFilterR;
     
+    // Drift State
+    float driftNoiseL, driftNoiseR;
+    int driftUpdateCounter;
+    float currentDriftDelay;
+    float currentDriftWidth;
+    float currentDriftLofi;
+    float currentDriftDiff;
+    float currentDriftFeedback;
+    float smoothedLofiSR;
+    float smoothedDiffusion;
+    float smoothedFeedback;
+
     // Diffusion State
     AllPassState apd1L, apd2L, apd1R, apd2R;
     float apdLfoPhase;
@@ -133,6 +146,7 @@ enum {
     kParam_LoFiSmooth,
     kParam_TapeSat,
     kParam_Diffusion,
+    kParam_Drift,
     kNumParameters
 };
 
@@ -186,12 +200,13 @@ static const _NT_parameter parameters[] = {
     [kParam_LoFiSmooth] = { .name = "Smoothing", .min = 0, .max = 100, .def = 0, .unit = kNT_unitPercent },
     [kParam_TapeSat]  = { .name = "Tape Sat", .min = 0, .max = 100, .def = 0, .unit = kNT_unitPercent },
     [kParam_Diffusion]= { .name = "Diffusion",.min = 0, .max = 100, .def = 0, .unit = kNT_unitPercent },
+    [kParam_Drift]    = { .name = "Drift",    .min = 0, .max = 100, .def = 0, .unit = kNT_unitPercent },
 };
 
 // Parameter pages
 static const uint8_t page1[] = { kParam_DryInL, kParam_DryInR, kParam_FBInL, kParam_FBInR, kParam_ClockIn, kParam_OutL, kParam_OutL_Mode, kParam_OutR, kParam_OutR_Mode };
 static const uint8_t page2[] = { kParam_Freeze, kParam_Division, kParam_Triplet, kParam_Dotted, kParam_Crossfade, kParam_PingPong, kParam_LoopMode, kParam_Sync, kParam_MidiChannel, kParam_Tempo };
-static const uint8_t page3[] = { kParam_Feedback, kParam_Resonance, kParam_Base, kParam_Width, kParam_BitDepth, kParam_LoFiSR, kParam_LoFiSmooth, kParam_TapeSat, kParam_Diffusion };
+static const uint8_t page3[] = { kParam_Feedback, kParam_Resonance, kParam_Base, kParam_Width, kParam_BitDepth, kParam_LoFiSR, kParam_LoFiSmooth, kParam_TapeSat, kParam_Diffusion, kParam_Drift };
 
 static const _NT_parameterPage pages[] = {
     { .name = "Routing & I/O", .numParams = ARRAY_SIZE(page1), .params = page1 },
@@ -503,6 +518,18 @@ _NT_algorithm* construct(const _NT_algorithmMemoryPtrs& ptrs, const _NT_algorith
     alg->lofiSR = 0.0f;
     alg->lofiSmooth = 0.0f;
     alg->diffusion = 0.0f;
+    alg->drift = 0.0f;
+    alg->driftNoiseL = 0.0f;
+    alg->driftNoiseR = 0.0f;
+    alg->driftUpdateCounter = 0;
+    alg->currentDriftDelay = 0.0f;
+    alg->currentDriftWidth = 0.0f;
+    alg->currentDriftLofi = 0.0f;
+    alg->currentDriftDiff = 0.0f;
+    alg->currentDriftFeedback = 0.0f;
+    alg->smoothedLofiSR = 0.0f;
+    alg->smoothedDiffusion = 0.0f;
+    alg->smoothedFeedback = 1.0f;
     alg->apdLfoPhase = 0.0f;
 
     // Setup APD Pointers (at end of main buffer)
@@ -566,6 +593,7 @@ void parameterChanged(_NT_algorithm* self, int p) {
         case kParam_Base: pThis->base = self->v[p] / 127.0f; break;
         case kParam_Width: pThis->width = self->v[p] / 127.0f; break;
         case kParam_Diffusion: pThis->diffusion = self->v[p] / 100.0f; break;
+        case kParam_Drift: pThis->drift = self->v[p] / 100.0f; break;
         default: break;
     }
 }
@@ -747,6 +775,56 @@ void step(_NT_algorithm* self, float* busFrames, int numFramesBy4) {
     }
     pThis->wasFrozen = pThis->freeze;
 
+    // --- Global Drift Calculation (Decimated Block Rate) ---
+    pThis->driftUpdateCounter -= numFrames;
+    if (pThis->driftUpdateCounter <= 0) {
+        pThis->driftUpdateCounter = 64; // Update every 64 samples
+        
+        float driftAmount = pThis->drift;
+        if (driftAmount > 0.0f) {
+            // Rate scales with drift amount (higher = faster movement)
+            float rate = 0.0005f + (driftAmount * 0.005f); 
+            
+            // Update Filtered Noise (L/R decorrelated)
+            float rawL = (getNoise(pThis->rngState) - 0.5f) * 2.0f;
+            float rawR = (getNoise(pThis->rngState) - 0.5f) * 2.0f;
+            
+            // Correlate: Mix 50% of L into R for cohesion (simulating shared PSU sag)
+            float nL = rawL;
+            float nR = (rawR * 0.5f) + (rawL * 0.5f);
+            
+            pThis->driftNoiseL += (nL - pThis->driftNoiseL) * rate;
+            pThis->driftNoiseR += (nR - pThis->driftNoiseR) * rate;
+            
+            // 1. Delay Length (High Sensitivity): Scale with delay length (~0.2% max)
+            pThis->currentDriftDelay = pThis->driftNoiseL * driftAmount * pThis->smoothedDelayLen * 0.002f; 
+            
+            // 2. Width (Medium Sensitivity): Only if not at default (1.0)
+            if (pThis->width < 0.99f) {
+                pThis->currentDriftWidth = pThis->driftNoiseR * (1.0f - pThis->width) * driftAmount * 0.5f;
+            } else {
+                pThis->currentDriftWidth = 0.0f;
+            }
+            
+            // 3. Lo-Fi SR & Diffusion (Low Sensitivity)
+            if (pThis->lofiSR > 0.01f) pThis->currentDriftLofi = pThis->driftNoiseL * pThis->lofiSR * driftAmount * 0.2f;
+            else pThis->currentDriftLofi = 0.0f;
+            
+            if (pThis->diffusion > 0.01f) pThis->currentDriftDiff = pThis->driftNoiseR * pThis->diffusion * driftAmount * 0.2f;
+            else pThis->currentDriftDiff = 0.0f;
+
+            // 4. Feedback (Low Sensitivity)
+            if (pThis->feedback > 0.001f) pThis->currentDriftFeedback = pThis->driftNoiseR * pThis->feedback * driftAmount * 0.1f;
+            else pThis->currentDriftFeedback = 0.0f;
+        } else {
+            pThis->currentDriftDelay = 0.0f;
+            pThis->currentDriftWidth = 0.0f;
+            pThis->currentDriftLofi = 0.0f;
+            pThis->currentDriftDiff = 0.0f;
+            pThis->currentDriftFeedback = 0.0f;
+        }
+    }
+
     for (int i = 0; i < numFrames; ++i) {
         // 1. Read Input
         float inSampleL = dryL[i];
@@ -764,7 +842,17 @@ void step(_NT_algorithm* self, float* busFrames, int numFramesBy4) {
         // Smoothing
         const float kParamSlew = 0.002f;
         pThis->smoothedBase += (pThis->base - pThis->smoothedBase) * kParamSlew;
-        pThis->smoothedWidth += (pThis->width - pThis->smoothedWidth) * kParamSlew;
+        float targetWidth = my_max(0.0f, my_min(1.0f, pThis->width + pThis->currentDriftWidth));
+        pThis->smoothedWidth += (targetWidth - pThis->smoothedWidth) * kParamSlew;
+        
+        float targetLofi = my_max(0.0f, my_min(1.0f, pThis->lofiSR + pThis->currentDriftLofi));
+        pThis->smoothedLofiSR += (targetLofi - pThis->smoothedLofiSR) * kParamSlew;
+        
+        float targetDiff = my_max(0.0f, my_min(1.0f, pThis->diffusion + pThis->currentDriftDiff));
+        pThis->smoothedDiffusion += (targetDiff - pThis->smoothedDiffusion) * kParamSlew;
+
+        float targetFb = my_max(0.0f, pThis->feedback + pThis->currentDriftFeedback);
+        pThis->smoothedFeedback += (targetFb - pThis->smoothedFeedback) * kParamSlew;
 
         // 1. Detect Macro Jumps (e.g., changing divisions)
         float targetLen = (float)pThis->currentDelayLen;
@@ -787,7 +875,7 @@ void step(_NT_algorithm* self, float* busFrames, int numFramesBy4) {
 
         // 2. Slew for Micro-corrections
         // Use 0.001f for standard tracking to stay locked to grid
-        pThis->smoothedDelayLen += (pThis->fadeTargetLen - pThis->smoothedDelayLen) * 0.001f;
+        pThis->smoothedDelayLen += ((pThis->fadeTargetLen + pThis->currentDriftDelay) - pThis->smoothedDelayLen) * 0.001f;
 
         // 3. Read Main Tap (Tap A)
         float readPos = 0.0f;
@@ -844,12 +932,14 @@ void step(_NT_algorithm* self, float* busFrames, int numFramesBy4) {
         // Sample Rate Reduction
         // 1. Calculate Step Size (Frequency)
         // Logarithmic mapping for "Frequency Ratio" feel
-        float lofiNorm = 1.0f - pThis->lofiSR;
+        float lofiNorm = 1.0f - pThis->smoothedLofiSR;
         float stepSize = getLinearInterp(lofiNorm, kPow1000Table) * 0.001f;
 
         // Jitter: Add randomness to the clock rate
-        float jitter = (getNoise(pThis->rngState) - 0.5f) * 0.02f * stepSize;
-        stepSize += jitter;
+        if (pThis->smoothedLofiSR > 0.001f) {
+            float jitter = (getNoise(pThis->rngState) - 0.5f) * 0.02f * stepSize;
+            stepSize += jitter;
+        }
         
         // 2. Adaptive Pre-Filter (One-pole LPF)
         // Cutoff tracks the step size to prevent aliasing
@@ -907,7 +997,7 @@ void step(_NT_algorithm* self, float* busFrames, int numFramesBy4) {
         delayR = processTape(delayR, drive, tapeAmount, pThis->tapeR, dcCoeffs);
 
         // Diffusion (Nested All-Pass)
-        if (pThis->diffusion > 0.0f) {
+        if (pThis->smoothedDiffusion > 0.0f) {
             // Slow LFO for modulation (approx 0.2Hz)
             pThis->apdLfoPhase += 0.000013f; 
             if (pThis->apdLfoPhase > 6.283f) pThis->apdLfoPhase -= 6.283f;
@@ -927,8 +1017,8 @@ void step(_NT_algorithm* self, float* busFrames, int numFramesBy4) {
             float cfL = diffL + 0.05f * diffR;
             float cfR = diffR + 0.05f * diffL;
 
-            delayL = (delayL * (1.0f - pThis->diffusion)) + (cfL * pThis->diffusion);
-            delayR = (delayR * (1.0f - pThis->diffusion)) + (cfR * pThis->diffusion);
+            delayL = (delayL * (1.0f - pThis->smoothedDiffusion)) + (cfL * pThis->smoothedDiffusion);
+            delayR = (delayR * (1.0f - pThis->smoothedDiffusion)) + (cfR * pThis->smoothedDiffusion);
         }
 
         // --- Transparent Look-Ahead Limiter ---
@@ -980,7 +1070,7 @@ void step(_NT_algorithm* self, float* busFrames, int numFramesBy4) {
         if (fbInL) fbSourceL = fbInL[i];
         if (fbInR) fbSourceR = fbInR[i];
 
-        float fbVal = pThis->feedback;
+        float fbVal = pThis->smoothedFeedback;
         
         // Fade feedback to 0% when recording (gainWet goes to 0)
         float currentFb = fbVal * gainWet;
