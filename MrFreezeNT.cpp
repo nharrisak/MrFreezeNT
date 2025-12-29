@@ -66,14 +66,23 @@ struct MrFreezeAlgorithm : public _NT_algorithm {
     BiquadState hpfStateL, hpfStateR;
     BiquadState tiltStateL, tiltStateR;
 
-    // Clock State
+    // Clock State (External CV)
     float lastClockSample;
     uint32_t framesSinceLastClock;
-    float detectedBpm;
+    float detectedBpm;             // Instantaneous BPM for display
+    float stableExtBpm;            // BPM averaged over multiple pulses
+    uint32_t extClockPulseCount;   // Count pulses for averaging
+    uint32_t extClockAccumFrames;  // Accumulated frames over pulses
 
     // MIDI Clock State
     uint32_t framesSinceLastMidiClock;
-    float detectedMidiBpm;
+    float detectedMidiBpm;         // Instantaneous BPM for display
+    float stableMidiBpm;           // BPM updated only after full beat (24 pulses)
+    uint32_t midiClockPulseCount;  // Count pulses (0-23)
+    uint32_t midiClockAccumFrames; // Accumulated frames over 24 pulses
+    
+    // Shared sync state
+    float smoothedDelayTarget;     // Smoothed target delay for hysteresis
     int activeNoteCount;
 
     // Limiter State
@@ -540,8 +549,15 @@ _NT_algorithm* construct(const _NT_algorithmMemoryPtrs& ptrs, const _NT_algorith
     alg->lastClockSample = 0.0f;
     alg->framesSinceLastClock = 0;
     alg->detectedBpm = 120.0f;
+    alg->stableExtBpm = 120.0f;
+    alg->extClockPulseCount = 0;
+    alg->extClockAccumFrames = 0;
     alg->framesSinceLastMidiClock = 0;
     alg->detectedMidiBpm = 120.0f;
+    alg->stableMidiBpm = 120.0f;
+    alg->midiClockPulseCount = 0;
+    alg->midiClockAccumFrames = 0;
+    alg->smoothedDelayTarget = 0.0f;
     alg->activeNoteCount = 0;
     alg->limiterGain = 1.0f;
     alg->wasFrozen = false;
@@ -677,17 +693,38 @@ void parameterChanged(_NT_algorithm* self, int p) {
 
 void midiRealtime(_NT_algorithm* self, uint8_t byte) {
     MrFreezeAlgorithm* pThis = (MrFreezeAlgorithm*)self;
-    if (byte == 0xF8) { // Timing Clock
+    if (byte == 0xF8) { // Timing Clock (24 PPQN)
+        // Accumulate frames across pulses
+        pThis->midiClockAccumFrames += pThis->framesSinceLastMidiClock;
+        pThis->midiClockPulseCount++;
+        
+        // Calculate instantaneous BPM for responsive display (heavily smoothed)
         if (pThis->framesSinceLastMidiClock > 0) {
             float seconds = pThis->framesSinceLastMidiClock / (float)NT_globals.sampleRate;
-            if (seconds > 0.001f) {
-                // 24 pulses per quarter note
-                float newBpm = 60.0f / (seconds * 24.0f);
-                // Simple smoothing
-                pThis->detectedMidiBpm = pThis->detectedMidiBpm * 0.99f + newBpm * 0.01f;
+            if (seconds > 0.001f && seconds < 0.5f) { // Sanity check
+                float instantBpm = 60.0f / (seconds * 24.0f);
+                pThis->detectedMidiBpm = pThis->detectedMidiBpm * 0.95f + instantBpm * 0.05f;
             }
         }
+        
+        // After 24 pulses (1 beat), calculate stable BPM
+        if (pThis->midiClockPulseCount >= 24) {
+            float totalSeconds = pThis->midiClockAccumFrames / (float)NT_globals.sampleRate;
+            if (totalSeconds > 0.1f && totalSeconds < 4.0f) { // Sanity: 15-600 BPM range
+                float beatBpm = 60.0f / totalSeconds;
+                // Smooth the stable BPM slightly for gradual tempo changes
+                pThis->stableMidiBpm = pThis->stableMidiBpm * 0.7f + beatBpm * 0.3f;
+            }
+            pThis->midiClockPulseCount = 0;
+            pThis->midiClockAccumFrames = 0;
+        }
+        
         pThis->framesSinceLastMidiClock = 0;
+    }
+    else if (byte == 0xFA || byte == 0xFB) { // Start or Continue
+        // Reset accumulator on transport start
+        pThis->midiClockPulseCount = 0;
+        pThis->midiClockAccumFrames = 0;
     }
 }
 
@@ -794,15 +831,31 @@ void step(_NT_algorithm* self, float* busFrames, int numFramesBy4) {
     // Determine BPM
     float bpm = 120.0f;
     if (pThis->sync == 1 && clk) { // Sync: Clock
-        // Simple Clock Detector
+        // External Clock Detector with multi-pulse averaging
         for(int i=0; i<numFrames; ++i) {
             float s = clk[i];
             if (s > 2.0f && pThis->lastClockSample <= 2.0f) { // Rising edge
                 if (pThis->framesSinceLastClock > 0) {
                     float seconds = pThis->framesSinceLastClock / (float)NT_globals.sampleRate;
-                    if (seconds > 0.001f) {
-                        pThis->detectedBpm = 60.0f / seconds;
-                        // Handle 24ppqn or other dividers here if necessary, assuming 1/4 note triggers for now
+                    if (seconds > 0.01f && seconds < 4.0f) { // Sanity: 15-6000 BPM range
+                        // Instantaneous BPM for display (smoothed)
+                        float instantBpm = 60.0f / seconds;
+                        pThis->detectedBpm = pThis->detectedBpm * 0.8f + instantBpm * 0.2f;
+                        
+                        // Accumulate for stable BPM calculation
+                        pThis->extClockAccumFrames += pThis->framesSinceLastClock;
+                        pThis->extClockPulseCount++;
+                        
+                        // After 4 pulses, calculate stable BPM (1 bar at 4/4)
+                        if (pThis->extClockPulseCount >= 4) {
+                            float totalSeconds = pThis->extClockAccumFrames / (float)NT_globals.sampleRate;
+                            if (totalSeconds > 0.1f) {
+                                float barBpm = (60.0f * 4.0f) / totalSeconds; // 4 beats
+                                pThis->stableExtBpm = pThis->stableExtBpm * 0.7f + barBpm * 0.3f;
+                            }
+                            pThis->extClockPulseCount = 0;
+                            pThis->extClockAccumFrames = 0;
+                        }
                     }
                 }
                 pThis->framesSinceLastClock = 0;
@@ -810,9 +863,11 @@ void step(_NT_algorithm* self, float* busFrames, int numFramesBy4) {
             pThis->framesSinceLastClock++;
             pThis->lastClockSample = s;
         }
-        bpm = pThis->detectedBpm;
+        // Use stable BPM for actual delay calculation
+        bpm = pThis->stableExtBpm;
     } else if (pThis->sync == 2) { // Sync: MIDI
-        bpm = pThis->detectedMidiBpm;
+        // Use stable BPM (averaged over 1 beat) for actual delay calculation
+        bpm = pThis->stableMidiBpm;
     } else {
         // Sync: Int
         bpm = pThis->tempo;
@@ -839,7 +894,41 @@ void step(_NT_algorithm* self, float* busFrames, int numFramesBy4) {
     if (pThis->dotted) beats *= 1.5f;
 
     float samplesPerBeat = (NT_globals.sampleRate * 60.0f) / bpm;
-    uint32_t delayLen = (uint32_t)(samplesPerBeat * beats);
+    float rawDelayLen = samplesPerBeat * beats;
+    if (rawDelayLen < 1.0f) rawDelayLen = 1.0f;
+    if (rawDelayLen > (float)pThis->bufferSize) rawDelayLen = (float)pThis->bufferSize;
+    
+    // Detect large jumps BEFORE smoothing (e.g., division changes)
+    // Compare raw target against current smoothed target
+    float jumpDiff = my_abs(rawDelayLen - pThis->smoothedDelayTarget);
+    float jumpThreshold = (float)NT_globals.sampleRate * 0.025f; // 25ms = intentional change
+    
+    if (pThis->smoothedDelayTarget < 1.0f) {
+        // First run - initialize directly
+        pThis->smoothedDelayTarget = rawDelayLen;
+    } else if (jumpDiff > jumpThreshold) {
+        // Large change detected (division change, tempo jump, etc.)
+        // Don't smooth - let the per-sample jump detection handle crossfade
+        pThis->smoothedDelayTarget = rawDelayLen;
+    } else {
+        // Small change (clock jitter) - apply hysteresis and slow smoothing
+        float jitterThreshold = pThis->smoothedDelayTarget * 0.005f; // 0.5% threshold
+        if (jitterThreshold < 1.0f) jitterThreshold = 1.0f;
+        
+        if (jumpDiff > jitterThreshold) {
+            // Update target with slow interpolation to prevent wobble
+            if (pThis->sync == 1 || pThis->sync == 2) {
+                // External clock or MIDI: very slow interpolation
+                pThis->smoothedDelayTarget = pThis->smoothedDelayTarget * 0.9995f + rawDelayLen * 0.0005f;
+            } else {
+                // Internal tempo: faster response for manual adjustments
+                pThis->smoothedDelayTarget = pThis->smoothedDelayTarget * 0.99f + rawDelayLen * 0.01f;
+            }
+        }
+        // Below jitter threshold: don't update at all (hysteresis)
+    }
+    
+    uint32_t delayLen = (uint32_t)(pThis->smoothedDelayTarget + 0.5f);
     if (delayLen < 1) delayLen = 1;
     if (delayLen > pThis->bufferSize) delayLen = pThis->bufferSize;
     
