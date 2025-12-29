@@ -133,6 +133,17 @@ struct MrFreezeAlgorithm : public _NT_algorithm {
     float prevReadPos;
     float lastReadInc;
 
+    // Cached Filter Coefficients (avoid recalculating every step)
+    float cachedHpfCoeffs[5];
+    float cachedLpfCoeffs[5];
+    float cachedDcCoeffs[5];
+    float cachedTiltCoeffs[5];
+    float lastCalcBase;       // Last smoothedBase used for HPF calc
+    float lastCalcWidth;      // Last smoothedWidth used for LPF calc  
+    float lastCalcTone;       // Last smoothedTone used for tilt calc
+    float lastCalcResonance;  // Last resonance used for filter calc
+    bool coeffsInitialized;
+
     // Diffusion State
     AllPassState apd1L, apd2L, apd1R, apd2R;
     float apdLfoPhase;
@@ -617,6 +628,14 @@ _NT_algorithm* construct(const _NT_algorithmMemoryPtrs& ptrs, const _NT_algorith
     alg->fadeInc = 1.0f;
     alg->prevReadPos = 0.0f;
     alg->lastReadInc = 1.0f;
+    
+    // Initialize coefficient cache (will be calculated on first step)
+    alg->lastCalcBase = -1.0f;      // Force recalculation
+    alg->lastCalcWidth = -1.0f;
+    alg->lastCalcTone = -1.0f;
+    alg->lastCalcResonance = -1.0f;
+    alg->coeffsInitialized = false;
+    
     alg->apdLfoPhase = 0.0f;
 
     // Setup APD Pointers (at end of main buffer)
@@ -788,28 +807,51 @@ void step(_NT_algorithm* self, float* busFrames, int numFramesBy4) {
     const float* fbInL = (fbInLIdx > 0) ? busFrames + (fbInLIdx - 1) * numFrames : nullptr;
     const float* fbInR = (fbInRIdx > 0) ? busFrames + (fbInRIdx - 1) * numFrames : nullptr;
 
-    // Filter Coeffs (2-pole Resonant)
-    float hpfCoeffs[5], lpfCoeffs[5], dcCoeffs[5];
-    float Q = 0.707f * getLinearInterp(pThis->resonance, kPow20Table); // Logarithmic Q from 0.7 to ~14
-    
-    float tiltCoeffs[5];
-    calcTiltCoeffs(pThis->smoothedTone, (float)NT_globals.sampleRate, tiltCoeffs);
-
-    // Map Base (0-1) to Freq Norm (20Hz - 20kHz approx)
-    // Logarithmic mapping: f = f_min * (ratio)^val
-    float fBase = 0.00025f * getLinearInterp(pThis->smoothedBase, kPow1000Table);
-    float widthVal = pThis->smoothedBase + (pThis->smoothedWidth * (1.0f - pThis->smoothedBase));
-    float fWidth = 0.00025f * getLinearInterp(widthVal, kPow1000Table);
-    
-    // Clamp Width to Tape HF Roll-off (12kHz) to combine filters
+    // Filter Coefficients - cached to avoid recalculating every step
     float sr = (float)NT_globals.sampleRate;
-    float maxFWidth = 12000.0f / sr;
-    if (fWidth > maxFWidth) fWidth = maxFWidth;
-
-    calcFilterCoeffs(kFilterHPF, fBase, Q, hpfCoeffs);
-    calcFilterCoeffs(kFilterLPF, fWidth, Q, lpfCoeffs);
     
-    calcFilterCoeffs(kFilterHPF, 20.0f / sr, 0.707f, dcCoeffs);
+    // Check if any filter parameters have changed (use threshold to avoid floating point noise)
+    bool needRecalcFilters = !pThis->coeffsInitialized ||
+        my_abs(pThis->smoothedBase - pThis->lastCalcBase) > 0.001f ||
+        my_abs(pThis->smoothedWidth - pThis->lastCalcWidth) > 0.001f ||
+        my_abs(pThis->resonance - pThis->lastCalcResonance) > 0.001f;
+    
+    bool needRecalcTilt = !pThis->coeffsInitialized ||
+        my_abs(pThis->smoothedTone - pThis->lastCalcTone) > 0.001f;
+    
+    if (needRecalcFilters) {
+        float Q = 0.707f * getLinearInterp(pThis->resonance, kPow20Table);
+        
+        // Map Base (0-1) to Freq Norm (20Hz - 20kHz approx)
+        float fBase = 0.00025f * getLinearInterp(pThis->smoothedBase, kPow1000Table);
+        float widthVal = pThis->smoothedBase + (pThis->smoothedWidth * (1.0f - pThis->smoothedBase));
+        float fWidth = 0.00025f * getLinearInterp(widthVal, kPow1000Table);
+        
+        // Clamp Width to Tape HF Roll-off (12kHz)
+        float maxFWidth = 12000.0f / sr;
+        if (fWidth > maxFWidth) fWidth = maxFWidth;
+        
+        calcFilterCoeffs(kFilterHPF, fBase, Q, pThis->cachedHpfCoeffs);
+        calcFilterCoeffs(kFilterLPF, fWidth, Q, pThis->cachedLpfCoeffs);
+        calcFilterCoeffs(kFilterHPF, 20.0f / sr, 0.707f, pThis->cachedDcCoeffs);
+        
+        pThis->lastCalcBase = pThis->smoothedBase;
+        pThis->lastCalcWidth = pThis->smoothedWidth;
+        pThis->lastCalcResonance = pThis->resonance;
+    }
+    
+    if (needRecalcTilt) {
+        calcTiltCoeffs(pThis->smoothedTone, sr, pThis->cachedTiltCoeffs);
+        pThis->lastCalcTone = pThis->smoothedTone;
+    }
+    
+    pThis->coeffsInitialized = true;
+    
+    // Use cached coefficients
+    float* hpfCoeffs = pThis->cachedHpfCoeffs;
+    float* lpfCoeffs = pThis->cachedLpfCoeffs;
+    float* dcCoeffs = pThis->cachedDcCoeffs;
+    float* tiltCoeffs = pThis->cachedTiltCoeffs;
 
     // Update Tape Coeffs if SR changed
     if (sr != pThis->lastSampleRate || pThis->tapeSat != pThis->lastTapeSat) {
@@ -1311,8 +1353,9 @@ void step(_NT_algorithm* self, float* busFrames, int numFramesBy4) {
             delayR = bitCrush(delayR, pThis->bitDepth, pThis->rngState);
         }
 
-        // Tilt EQ
+        // Tilt EQ - bypass when tone is centered (0.5)
         if (my_abs(pThis->smoothedTone - 0.5f) < 0.005f) {
+            // Reset filter state when bypassed to prevent clicks when re-enabled
             pThis->tiltStateL = {};
             pThis->tiltStateR = {};
         } else {
@@ -1321,8 +1364,8 @@ void step(_NT_algorithm* self, float* busFrames, int numFramesBy4) {
         }
 
         // Filters (Base/Width)
-        // HPF Bypass Logic
-        if (pThis->smoothedBase <= 0.0001f) {
+        // HPF Bypass - when base frequency is at minimum (no high-pass filtering)
+        if (pThis->smoothedBase <= 0.001f) {
             pThis->hpfStateL = {};
             pThis->hpfStateR = {};
         } else {
@@ -1330,20 +1373,25 @@ void step(_NT_algorithm* self, float* busFrames, int numFramesBy4) {
             delayR = processBiquad(delayR, pThis->hpfStateR, hpfCoeffs);
         }
 
-        // LPF Bypass Logic
-        // Always run LPF because it now handles the Tape HF Roll-off (12kHz limit)
-        delayL = processBiquad(delayL, pThis->lpfStateL, lpfCoeffs);
-        delayR = processBiquad(delayR, pThis->lpfStateR, lpfCoeffs);
+        // LPF Bypass - when width is at maximum (no low-pass filtering beyond tape roll-off)
+        // Width >= 0.999 means LPF frequency is at 12kHz ceiling, effectively bypassed for user control
+        if (pThis->smoothedWidth >= 0.999f && pThis->smoothedBase <= 0.001f) {
+            // Full bypass when both base and width are at extremes (no filtering at all)
+            pThis->lpfStateL = {};
+            pThis->lpfStateR = {};
+        } else {
+            delayL = processBiquad(delayL, pThis->lpfStateL, lpfCoeffs);
+            delayR = processBiquad(delayR, pThis->lpfStateR, lpfCoeffs);
+        }
 
-        // Tape Saturation (Always On)
-        // Map the 0-100% parameter to 1.0 (clean) to 1.5 (warm/saturated)
-        float tapeAmount = pThis->tapeSat; // 0.0 to 1.0
+        // Tape Saturation (Always On - serves as soft clipper even at 0%)
+        float tapeAmount = pThis->tapeSat;
         float drive = 1.0f + (tapeAmount * 0.25f);
         delayL = processTape(delayL, drive, tapeAmount, pThis->tapeL, dcCoeffs);
         delayR = processTape(delayR, drive, tapeAmount, pThis->tapeR, dcCoeffs);
 
-        // Diffusion (Nested All-Pass)
-        if (pThis->smoothedDiffusion > 0.0f) {
+        // Diffusion (Nested All-Pass) - bypass when amount is zero
+        if (pThis->smoothedDiffusion > 0.001f) {
             // Slow LFO for modulation (approx 0.2Hz)
             pThis->apdLfoPhase += 0.000013f; 
             if (pThis->apdLfoPhase > 6.283f) pThis->apdLfoPhase -= 6.283f;
@@ -1373,6 +1421,12 @@ void step(_NT_algorithm* self, float* busFrames, int numFramesBy4) {
 
             delayL = (delayL * (1.0f - pThis->smoothedDiffusion)) + (cfL * pThis->smoothedDiffusion);
             delayR = (delayR * (1.0f - pThis->smoothedDiffusion)) + (cfR * pThis->smoothedDiffusion);
+        } else {
+            // Reset all-pass state when diffusion is bypassed
+            pThis->apd1L.head = 0;
+            pThis->apd2L.head = 0;
+            pThis->apd1R.head = 0;
+            pThis->apd2R.head = 0;
         }
 
         // --- Transparent Look-Ahead Limiter ---
