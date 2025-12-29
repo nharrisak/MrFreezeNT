@@ -62,7 +62,6 @@ struct MrFreezeAlgorithm : public _NT_algorithm {
     // State
     uint32_t bufferSize;
     uint32_t writeHead;
-    uint32_t freezeAnchor;
     BiquadState lpfStateL, lpfStateR;
     BiquadState hpfStateL, hpfStateR;
     BiquadState tiltStateL, tiltStateR;
@@ -120,6 +119,10 @@ struct MrFreezeAlgorithm : public _NT_algorithm {
     float smoothedLofiSR;
     float smoothedDiffusion;
     float smoothedFeedback;
+    float fadeReadPos;
+    float fadeInc;
+    float prevReadPos;
+    float lastReadInc;
 
     // Diffusion State
     AllPassState apd1L, apd2L, apd1R, apd2R;
@@ -198,7 +201,7 @@ static const _NT_parameter parameters[] = {
     [kParam_PingPong] = { .name = "Ping Pong", .min = 0, .max = 1, .def = 0, .unit = kNT_unitEnum, .enumStrings = s_offOn },
     [kParam_LoopMode] = { .name = "Loop Mode", .min = 0, .max = 2, .def = 0, .unit = kNT_unitEnum, .enumStrings = s_loopMode },
     [kParam_Sync]     = { .name = "Sync",      .min = 0, .max = 2, .def = 1, .unit = kNT_unitEnum, .enumStrings = s_sync },
-    [kParam_MidiChannel] = { .name = "MIDI Ch", .min = 0, .max = 16, .def = 0, .unit = kNT_unitNone },
+    [kParam_MidiChannel] = { .name = "MIDI Ch", .min = 0, .max = 15, .def = 0, .unit = kNT_unitNone },
     [kParam_Tempo]    = { .name = "Tempo",     .min = 30, .max = 300, .def = 120, .unit = kNT_unitBPM },
 
     // Page 3: Character & Filter
@@ -240,6 +243,24 @@ static const _NT_specification specificationsInfo[] = {
 static inline float my_abs(float x) { return (x < 0.0f) ? -x : x; }
 static inline float my_max(float a, float b) { return (a > b) ? a : b; }
 static inline float my_min(float a, float b) { return (a < b) ? a : b; }
+
+// Wrap buffer position into range [0, bufferSize)
+// More efficient than fmodf for buffer wrapping and doesn't require math library
+static inline float wrapBufferPos(float pos, uint32_t bufferSize) {
+    float size = (float)bufferSize;
+    // Handle negative values
+    if (pos < 0.0f) {
+        // Add size until positive (at most one addition needed for normal cases)
+        while (pos < 0.0f) pos += size;
+        return pos;
+    }
+    // Handle values >= bufferSize
+    if (pos >= size) {
+        // Subtract size until in range (at most one subtraction needed for normal cases)
+        while (pos >= size) pos -= size;
+    }
+    return pos;
+}
 
 // Sine Table (0 to pi/2) for Equal Power Crossfade
 // 32 segments (33 points)
@@ -454,12 +475,17 @@ static void calcTiltCoeffs(float tone, float sr, float* c) {
     float beta = sqrtf(A) / 0.707f;
 
     // Standard High-Shelf Coeffs (acts as tilt when centered)
-    float a0 = (A + 1.0f) + (A - 1.0f) * cs + beta * sn;
-    c[0] = (A * ((A + 1.0f) + (A - 1.0f) * cs + beta * sn)) / a0;
-    c[1] = (-2.0f * A * ((A - 1.0f) + (A + 1.0f) * cs)) / a0;
-    c[2] = (A * ((A + 1.0f) + (A - 1.0f) * cs - beta * sn)) / a0;
-    c[3] = (-2.0f * ((A - 1.0f) + (A + 1.0f) * cs)) / a0;
-    c[4] = ((A + 1.0f) - (A - 1.0f) * cs - beta * sn) / a0;
+    float ap1 = A + 1.0f;
+    float am1 = A - 1.0f;
+    float bsn = beta * sn;
+    float a0 = ap1 - am1 * cs + bsn;
+    float a0_inv = 1.0f / a0;
+
+    c[0] = (A * (ap1 + am1 * cs + bsn)) * a0_inv;
+    c[1] = (-2.0f * A * (am1 + ap1 * cs)) * a0_inv;
+    c[2] = (A * (ap1 + am1 * cs - bsn)) * a0_inv;
+    c[3] = (2.0f * (am1 - ap1 * cs)) * a0_inv;
+    c[4] = (ap1 - am1 * cs - bsn) * a0_inv;
 }
 
 // --- Core Functions ---
@@ -469,9 +495,11 @@ void calculateRequirements(_NT_algorithmRequirements& req, const int32_t* specif
     req.sram = sizeof(MrFreezeAlgorithm);
     
     // Calculate DRAM based on Max Delay Time (spec 0)
-    // Assuming 96kHz sample rate for safety, stereo (2 channels), float (4 bytes)
+    // maxTime is in seconds, convert to samples: maxTime * sampleRate
+    // Stereo (2 channels), float (4 bytes)
     int maxTime = specifications ? specifications[kSpec_MaxDelayTime] : 10;
-    req.dram = (maxTime * 96000 * 2 + kTotalApdSize) * sizeof(float);
+    uint32_t sampleRate = NT_globals.sampleRate;
+    req.dram = (maxTime * sampleRate * 2 + kTotalApdSize) * sizeof(float);
     
     req.dtc = 0;
     req.itc = 0;
@@ -486,9 +514,9 @@ _NT_algorithm* construct(const _NT_algorithmMemoryPtrs& ptrs, const _NT_algorith
     
     // Initialize state
     int maxTime = specifications ? specifications[kSpec_MaxDelayTime] : 10;
-    alg->bufferSize = maxTime * 96000; // Stereo frames
+    uint32_t sampleRate = NT_globals.sampleRate;
+    alg->bufferSize = maxTime * sampleRate; // Stereo frames (number of stereo sample pairs)
     alg->writeHead = 0;
-    alg->freezeAnchor = 0;
     
     // Initialize defaults
     alg->feedback = 1.0f; // 0dB
@@ -535,9 +563,11 @@ _NT_algorithm* construct(const _NT_algorithmMemoryPtrs& ptrs, const _NT_algorith
     alg->smoothedBase = 0.0f;
     alg->smoothedWidth = 1.0f;
     alg->smoothedTone = 0.5f;
-    alg->smoothedDelayLen = 48000.0f;
-    alg->fadeTargetLen = 48000.0f;
-    alg->fadeOldLen = 48000.0f;
+    // Initialize delay lengths to 0.5 seconds at current sample rate
+    float initialDelayLen = sampleRate * 0.5f;
+    alg->smoothedDelayLen = initialDelayLen;
+    alg->fadeTargetLen = initialDelayLen;
+    alg->fadeOldLen = initialDelayLen;
     alg->fadePhase = 1.0f;
     // Coeffs will be calc'd in step
     alg->rngState = 0x5EED;
@@ -567,10 +597,15 @@ _NT_algorithm* construct(const _NT_algorithmMemoryPtrs& ptrs, const _NT_algorith
     alg->smoothedLofiSR = 0.0f;
     alg->smoothedDiffusion = 0.0f;
     alg->smoothedFeedback = 1.0f;
+    alg->fadeReadPos = 0.0f;
+    alg->fadeInc = 1.0f;
+    alg->prevReadPos = 0.0f;
+    alg->lastReadInc = 1.0f;
     alg->apdLfoPhase = 0.0f;
 
     // Setup APD Pointers (at end of main buffer)
-    float* apdBase = alg->audioBuffer + (maxTime * 96000 * 2);
+    // Main buffer is maxTime seconds * sampleRate frames * 2 channels (interleaved)
+    float* apdBase = alg->audioBuffer + (maxTime * sampleRate * 2);
     alg->apd1L.buffer = apdBase; alg->apd1L.size = kApdSize1; alg->apd1L.head = 0;
     apdBase += kApdSize1;
     alg->apd2L.buffer = apdBase; alg->apd2L.size = kApdSize2; alg->apd2L.head = 0;
@@ -649,7 +684,7 @@ void midiRealtime(_NT_algorithm* self, uint8_t byte) {
                 // 24 pulses per quarter note
                 float newBpm = 60.0f / (seconds * 24.0f);
                 // Simple smoothing
-                pThis->detectedMidiBpm = pThis->detectedMidiBpm * 0.9f + newBpm * 0.1f;
+                pThis->detectedMidiBpm = pThis->detectedMidiBpm * 0.99f + newBpm * 0.01f;
             }
         }
         pThis->framesSinceLastMidiClock = 0;
@@ -807,6 +842,7 @@ void step(_NT_algorithm* self, float* busFrames, int numFramesBy4) {
     uint32_t delayLen = (uint32_t)(samplesPerBeat * beats);
     if (delayLen < 1) delayLen = 1;
     if (delayLen > pThis->bufferSize) delayLen = pThis->bufferSize;
+    
     pThis->currentDelayLen = delayLen;
 
     // Calculate Window Size for Dry/Wet Fade
@@ -814,10 +850,6 @@ void step(_NT_algorithm* self, float* busFrames, int numFramesBy4) {
     if (W_fade < 1) W_fade = 1;
     float dryFadeStep = 1.0f / (float)W_fade;
 
-    // Handle Freeze Transition
-    if (pThis->freeze && !pThis->wasFrozen) {
-        pThis->freezeAnchor = pThis->writeHead;
-    }
     pThis->wasFrozen = pThis->freeze;
 
     // --- Global Drift Calculation (Decimated Block Rate) ---
@@ -922,12 +954,21 @@ void step(_NT_algorithm* self, float* busFrames, int numFramesBy4) {
         float jumpDiff = my_abs(targetLen - pThis->fadeTargetLen);
         
         if (pThis->loopMode != pThis->lastLoopMode) {
-            jumpDiff = 1000.0f; // Force jump
+            jumpDiff = 10000.0f; // Force jump
             pThis->lastLoopMode = pThis->loopMode;
         }
 
-        if (jumpDiff > 100.0f) { // 100 sample threshold
-            pThis->fadeOldLen = pThis->smoothedDelayLen;
+        // 25ms threshold to prevent jitter resets (sample-rate dependent)
+        float jumpThreshold = (float)NT_globals.sampleRate * 0.025f;
+        if (jumpDiff > jumpThreshold) {
+            // Capture state for fade out (Linear Continuation)
+            pThis->fadeReadPos = pThis->prevReadPos;
+            pThis->fadeInc = pThis->lastReadInc;
+            // Safety clamp for velocity
+            if (pThis->fadeInc > 2.0f) pThis->fadeInc = 2.0f;
+            if (pThis->fadeInc < -2.0f) pThis->fadeInc = -2.0f;
+
+            pThis->fadeOldLen = pThis->smoothedDelayLen; // Kept for reference
             pThis->fadeTargetLen = targetLen;
             pThis->smoothedDelayLen = targetLen; // Instantly jump to the new length
             pThis->fadePhase = 0.0f; // Reset crossfade progress
@@ -964,38 +1005,84 @@ void step(_NT_algorithm* self, float* busFrames, int numFramesBy4) {
         }
 
         // 4. Map to Offset
-        float pingPongOffset = pThis->reversePhase;
+        float pingPongOffset = 0.0f; // Default for Mode 0 (Standard Delay)
         float secondaryOffset = -9999.0f; // Flag for no secondary
         float bounceFade = 0.0f;
-        float fadeLen = my_min(192.0f, L * 0.4f); // ~2ms fade, capped for short loops
+        
+        // Calculate Fade Length based on parameter (0-50% of loop)
+        // Ensure minimum of 4 samples to prevent division by zero
+        float fadeLen = my_max(4.0f, L * (pThis->crossfade * 0.01f));
 
         if (pThis->loopMode == 2) { // Ping-Pong
-            // Top Turnaround (L)
+            // Top Turnaround (L) - crossfade region when reversing
             if (pThis->reversePhase >= L && pThis->reversePhase < L + fadeLen) {
                 pingPongOffset = doubleL - pThis->reversePhase; // Main (Reverse)
-                secondaryOffset = pThis->reversePhase;          // Secondary (Forward Overshoot)
+                secondaryOffset = pThis->reversePhase - L;      // Secondary (Forward Overshoot amount)
                 bounceFade = (pThis->reversePhase - L) / fadeLen; // 0 (Old) -> 1 (New)
             }
-            // Bottom Turnaround (0)
+            // Bottom Turnaround (0) - crossfade region when reversing
             else if (pThis->reversePhase < fadeLen) {
                 pingPongOffset = pThis->reversePhase;           // Main (Forward)
-                secondaryOffset = -pThis->reversePhase;         // Secondary (Reverse Overshoot)
+                secondaryOffset = -pThis->reversePhase;         // Secondary (Reverse Overshoot amount, negative)
                 bounceFade = pThis->reversePhase / fadeLen;       // 0 (Old) -> 1 (New)
             }
-            else if (pingPongOffset > L) {
-                pingPongOffset = doubleL - pingPongOffset; // L -> 0
+            // Forward section (middle) - playing forward from fadeLen to L
+            else if (pThis->reversePhase < L) {
+                pingPongOffset = pThis->reversePhase; // Forward playback
             }
-        } else if (pThis->loopMode == 1) { // Reverse
-            pingPongOffset = L - pThis->reversePhase; // L -> 0
+            // Reverse section (middle) - playing reverse from L+fadeLen to doubleL
+            else {
+                // reversePhase >= L + fadeLen && reversePhase < doubleL
+                pingPongOffset = doubleL - pThis->reversePhase; // Reverse playback
+            }
+        } 
+        else if (pThis->loopMode == 1) { // Reverse
+            // In reverse, reversePhase goes 0->L, but we want to read backwards
+            // So we use reversePhase directly as the offset from anchor-L
+            pingPongOffset = pThis->reversePhase; // 0 -> L
+            // Loop Wrap-Around: when reversePhase wraps from L->0, we're at the start again
+            // Crossfade at the end (when reversePhase is near L, pingPongOffset is near L)
+            if (pingPongOffset > L - fadeLen) {
+                secondaryOffset = pingPongOffset - L; // Negative overshoot
+                bounceFade = (pingPongOffset - (L - fadeLen)) / fadeLen; // 0 (Old) -> 1 (New)
+            }
+        } 
+        // Mode 0 (Fwd): pingPongOffset remains 0.0f (Static)
+
+        // 5. Calculate Read Position
+        float anchor = (float)pThis->writeHead;
+        float readPos;
+        if (pThis->loopMode == 1) { // Reverse mode
+            // For reverse playback, readPos must DECREASE while anchor INCREASES
+            // Since anchor increases by 1 per sample, we need offset to increase by 2
+            // Formula: readPos = anchor - 1 - 2*reversePhase
+            // Sample 0: anchor=A, phase=0 → readPos = A-1 (newest)
+            // Sample 1: anchor=A+1, phase=1 → readPos = A+1-1-2 = A-2
+            // Sample k: anchor=A+k, phase=k → readPos = A+k-1-2k = A-1-k
+            // At phase=L-1: readPos = A-1-(L-1) = A-L (oldest)
+            readPos = anchor - 1.0f - 2.0f * pingPongOffset;
+        } else if (pThis->loopMode == 2) { // Ping-Pong
+            if (pThis->reversePhase >= L) {
+                // Reverse section: must start where forward ended and go backwards
+                // Forward ended at readPos = A-1 when anchor was at A+L-1
+                // Now anchor is at A+L (when reversePhase=L), we need readPos = A-1
+                // Formula: readPos = anchor - L - 1 - 2*(reversePhase - L)
+                // At reversePhase=L: anchor=A+L, readPos = A+L-L-1-0 = A-1 (newest)
+                // At reversePhase=2L-1: anchor=A+2L-1, readPos = A+2L-1-L-1-2*(L-1) = A-L (oldest)
+                float reverseSectionPhase = pThis->reversePhase - L;
+                readPos = anchor - L - 1.0f - 2.0f * reverseSectionPhase;
+            } else {
+                // Forward section: standard delay behavior (readPos = anchor - L)
+                // This keeps readPos at a fixed distance from write head
+                readPos = anchor - L;
+            }
+        } else {
+            // Forward mode: standard delay (read from anchor - L)
+            readPos = anchor - L;
         }
-        // Mode 0 (Fwd): pingPongOffset = reversePhase (0 -> L)
 
-        // 5. Calculate Read Position (Anchor is static when Frozen)
-        float anchor = (float)(pThis->freeze ? pThis->freezeAnchor : pThis->writeHead);
-        float readPos = anchor - L + pingPongOffset;
-
-        while (readPos < 0.0f) readPos += (float)pThis->bufferSize;
-        while (readPos >= (float)pThis->bufferSize) readPos -= (float)pThis->bufferSize;
+        // Wrap around buffer
+        readPos = wrapBufferPos(readPos, pThis->bufferSize);
 
         uint32_t idxA = (uint32_t)readPos;
         uint32_t idxB = (idxA + 1) % pThis->bufferSize;
@@ -1008,9 +1095,35 @@ void step(_NT_algorithm* self, float* busFrames, int numFramesBy4) {
 
         // Apply Bounce Crossfade if active
         if (secondaryOffset > -9000.0f) {
-            float readPos2 = anchor - L + secondaryOffset;
-            while (readPos2 < 0.0f) readPos2 += (float)pThis->bufferSize;
-            while (readPos2 >= (float)pThis->bufferSize) readPos2 -= (float)pThis->bufferSize;
+            float readPos2;
+            if (pThis->loopMode == 1) { // Reverse mode
+                // Secondary represents the NEW loop starting from newest sample
+                // It should read backward from anchor-1 as the crossfade progresses
+                // crossfadeProgress = pingPongOffset - (L - fadeLen) = secondaryOffset + fadeLen
+                // readPos2 = anchor - 1 - 2*crossfadeProgress
+                float crossfadeProgress = secondaryOffset + fadeLen;
+                readPos2 = anchor - 1.0f - 2.0f * crossfadeProgress;
+            } else if (pThis->loopMode == 2) { // Ping-Pong
+                if (pThis->reversePhase >= L) {
+                    // Top turnaround: entering reverse from forward
+                    // Secondary is forward continuation - just keep using forward formula
+                    // Forward reads at readPos = anchor - L, so secondary continues this
+                    readPos2 = anchor - L;
+                } else {
+                    // Bottom turnaround: entering forward from reverse
+                    // Secondary is reverse continuation
+                    // Need to continue reading backward from where reverse section ended
+                    // Reverse section ended at position anchor-L-1 when reversePhase was 2L-1
+                    // Now reversePhase has wrapped to 0, we continue backward from there
+                    float crossfadeProgress = -secondaryOffset; // = reversePhase (0 to fadeLen)
+                    // At reversePhase=0 (crossfadeProgress=0): read from anchor-L-1
+                    // As crossfadeProgress increases, continue backward (subtract 2*progress for reverse speed)
+                    readPos2 = anchor - L - 1.0f - 2.0f * crossfadeProgress;
+                }
+            } else {
+                readPos2 = anchor - L + secondaryOffset;
+            }
+            readPos2 = wrapBufferPos(readPos2, pThis->bufferSize);
 
             uint32_t idxA2 = (uint32_t)readPos2;
             uint32_t idxB2 = (idxA2 + 1) % pThis->bufferSize;
@@ -1021,8 +1134,19 @@ void step(_NT_algorithm* self, float* busFrames, int numFramesBy4) {
             float delayR2 = pThis->audioBuffer[idxA2 * 2 + 1] * (1.0f - fraction2) + 
                             pThis->audioBuffer[idxB2 * 2 + 1] * fraction2;
 
-            float gMain = getSineInterp(bounceFade);
-            float gSec = getSineInterp(1.0f - bounceFade);
+            // Crossfade direction depends on mode:
+            // - Reverse mode: Main = current loop END, Secondary = new loop START
+            //   Want: fade FROM main (old) TO secondary (new)
+            // - Ping-pong turnarounds: Main = NEW direction starting, Secondary = OLD direction continuing  
+            //   Want: fade FROM secondary (old) TO main (new)
+            float gMain, gSec;
+            if (pThis->loopMode == 2) { // Ping-Pong: fade secondary → main
+                gMain = getSineInterp(bounceFade);           // 0→1 (fade in new direction)
+                gSec = getSineInterp(1.0f - bounceFade);     // 1→0 (fade out old direction)
+            } else { // Reverse: fade main → secondary
+                gMain = getSineInterp(1.0f - bounceFade);    // 1→0 (fade out current loop)
+                gSec = getSineInterp(bounceFade);            // 0→1 (fade in new loop)
+            }
 
             delayL = (delayL * gMain) + (delayL2 * gSec);
             delayR = (delayR * gMain) + (delayR2 * gSec);
@@ -1033,13 +1157,12 @@ void step(_NT_algorithm* self, float* busFrames, int numFramesBy4) {
             pThis->fadePhase += 1.0f / (sr * 0.025f); // 25ms fade
             if (pThis->fadePhase > 1.0f) pThis->fadePhase = 1.0f;
             
-            float readPosOld = (float)pThis->writeHead - pThis->fadeOldLen;
-            while (readPosOld < 0.0f) readPosOld += (float)pThis->bufferSize;
-            while (readPosOld >= (float)pThis->bufferSize) readPosOld -= (float)pThis->bufferSize;
+            pThis->fadeReadPos += pThis->fadeInc;
+            pThis->fadeReadPos = wrapBufferPos(pThis->fadeReadPos, pThis->bufferSize);
             
-            uint32_t idxA_Old = (uint32_t)readPosOld;
+            uint32_t idxA_Old = (uint32_t)pThis->fadeReadPos;
             uint32_t idxB_Old = (idxA_Old + 1) % pThis->bufferSize;
-            float fractionOld = readPosOld - (float)idxA_Old;
+            float fractionOld = pThis->fadeReadPos - (float)idxA_Old;
             
             float delayL_Old = pThis->audioBuffer[idxA_Old * 2] * (1.0f - fractionOld) + 
                                pThis->audioBuffer[idxB_Old * 2] * fractionOld;
@@ -1100,8 +1223,13 @@ void step(_NT_algorithm* self, float* busFrames, int numFramesBy4) {
         }
 
         // Tilt EQ
-        delayL = processBiquad(delayL, pThis->tiltStateL, tiltCoeffs);
-        delayR = processBiquad(delayR, pThis->tiltStateR, tiltCoeffs);
+        if (my_abs(pThis->smoothedTone - 0.5f) < 0.005f) {
+            pThis->tiltStateL = {};
+            pThis->tiltStateR = {};
+        } else {
+            delayL = processBiquad(delayL, pThis->tiltStateL, tiltCoeffs);
+            delayR = processBiquad(delayR, pThis->tiltStateR, tiltCoeffs);
+        }
 
         // Filters (Base/Width)
         // HPF Bypass Logic
@@ -1161,8 +1289,7 @@ void step(_NT_algorithm* self, float* busFrames, int numFramesBy4) {
         // --- Transparent Look-Ahead Limiter ---
         // 1. Look-Ahead Detection
         float futureReadPos = readPos + (float)lookAheadSamples;
-        while (futureReadPos < 0.0f) futureReadPos += (float)pThis->bufferSize;
-        while (futureReadPos >= (float)pThis->bufferSize) futureReadPos -= (float)pThis->bufferSize;
+        futureReadPos = wrapBufferPos(futureReadPos, pThis->bufferSize);
 
         uint32_t fIdxA = (uint32_t)futureReadPos;
         uint32_t fIdxB = (fIdxA + 1) % pThis->bufferSize;
@@ -1229,6 +1356,15 @@ void step(_NT_algorithm* self, float* busFrames, int numFramesBy4) {
         
         // Standard increment - the history is preserved behind us
         pThis->writeHead = (pThis->writeHead + 1) % pThis->bufferSize;
+
+        // Track Read Head Velocity for next Jump
+        float diff = readPos - pThis->prevReadPos;
+        // Handle buffer wrap
+        if (diff < -pThis->bufferSize * 0.5f) diff += (float)pThis->bufferSize;
+        if (diff > pThis->bufferSize * 0.5f) diff -= (float)pThis->bufferSize;
+        
+        pThis->lastReadInc = diff;
+        pThis->prevReadPos = readPos;
     }
 
     // Update MIDI clock counter
