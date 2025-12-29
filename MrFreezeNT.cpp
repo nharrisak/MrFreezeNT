@@ -55,7 +55,6 @@ struct MrFreezeAlgorithm : public _NT_algorithm {
     int bitDepth;
     float tapeSat;
     float lofiSR;
-    float lofiSmooth;
     float diffusion;
     float drift;
 
@@ -114,6 +113,8 @@ struct MrFreezeAlgorithm : public _NT_algorithm {
     float prevLofiSampleR;
     float lofiPreFilterL;
     float lofiPreFilterR;
+    float lofiPreFilter2L;  // Second pole for steeper anti-aliasing
+    float lofiPreFilter2R;
     
     // Drift State
     float driftNoiseL, driftNoiseR;
@@ -177,7 +178,6 @@ enum {
     kParam_Tone,
     kParam_BitDepth,
     kParam_LoFiSR,
-    kParam_LoFiSmooth,
     kParam_TapeSat,
     kParam_Diffusion,
     kParam_Drift,
@@ -231,8 +231,7 @@ static const _NT_parameter parameters[] = {
     [kParam_Width]    = { .name = "Width",    .min = 0, .max = 127, .def = 127, .unit = kNT_unitNone },
     [kParam_Tone]     = { .name = "Tone",     .min = 0, .max = 100, .def = 50, .unit = kNT_unitPercent },
     [kParam_BitDepth] = { .name = "Bit Depth",.min = 1, .max = 24, .def = 24, .unit = kNT_unitNone },
-    [kParam_LoFiSR]   = { .name = "Lo-Fi SR", .min = 0, .max = 100, .def = 0, .unit = kNT_unitPercent },
-    [kParam_LoFiSmooth] = { .name = "Smoothing", .min = 0, .max = 100, .def = 0, .unit = kNT_unitPercent },
+    [kParam_LoFiSR]   = { .name = "Lo-Fi", .min = 0, .max = 100, .def = 0, .unit = kNT_unitPercent },
     [kParam_TapeSat]  = { .name = "Tape Sat", .min = 0, .max = 100, .def = 0, .unit = kNT_unitPercent },
     [kParam_Diffusion]= { .name = "Diffusion",.min = 0, .max = 100, .def = 0, .unit = kNT_unitPercent },
     [kParam_Drift]    = { .name = "Drift",    .min = 0, .max = 100, .def = 0, .unit = kNT_unitPercent },
@@ -241,7 +240,7 @@ static const _NT_parameter parameters[] = {
 // Parameter pages
 static const uint8_t page1[] = { kParam_DryInL, kParam_DryInR, kParam_FBInL, kParam_FBInR, kParam_ClockIn, kParam_OutL, kParam_OutL_Mode, kParam_OutR, kParam_OutR_Mode };
 static const uint8_t page2[] = { kParam_Freeze, kParam_Division, kParam_Triplet, kParam_Dotted, kParam_Crossfade, kParam_PingPong, kParam_LoopMode, kParam_Sync, kParam_MidiChannel, kParam_Tempo };
-static const uint8_t page3[] = { kParam_Feedback, kParam_Resonance, kParam_Base, kParam_Width, kParam_Tone, kParam_BitDepth, kParam_LoFiSR, kParam_LoFiSmooth, kParam_TapeSat, kParam_Diffusion, kParam_Drift };
+static const uint8_t page3[] = { kParam_Feedback, kParam_Resonance, kParam_Base, kParam_Width, kParam_Tone, kParam_BitDepth, kParam_LoFiSR, kParam_TapeSat, kParam_Diffusion, kParam_Drift };
 
 static const _NT_parameterPage pages[] = {
     { .name = "Routing & I/O", .numParams = ARRAY_SIZE(page1), .params = page1 },
@@ -300,6 +299,27 @@ static inline float getSineInterp(float phase01) {
     if (idx > 31) idx = 31;
     float frac = idxF - (float)idx;
     return kSineTable[idx] * (1.0f - frac) + kSineTable[idx + 1] * frac;
+}
+
+// Cosine interpolation table: (1 - cos(t * PI)) / 2 for t = 0 to 1
+// Gives smooth S-curve interpolation (slow start, fast middle, slow end)
+static const float kCosineInterpTable[33] = {
+    0.000000f, 0.002410f, 0.009607f, 0.021530f, 0.038060f, 0.059039f, 0.084265f, 0.113495f,
+    0.146447f, 0.182803f, 0.222215f, 0.264302f, 0.308658f, 0.354858f, 0.402455f, 0.450991f,
+    0.500000f, 0.549009f, 0.597545f, 0.645142f, 0.691342f, 0.735698f, 0.777785f, 0.817197f,
+    0.853553f, 0.886505f, 0.915735f, 0.940961f, 0.961940f, 0.978470f, 0.990393f, 0.997590f,
+    1.000000f
+};
+
+// Cosine interpolation: S-curve from 0 to 1 (smoother than linear)
+static inline float getCosineInterp(float phase01) {
+    if (phase01 <= 0.0f) return 0.0f;
+    if (phase01 >= 1.0f) return 1.0f;
+    float idxF = phase01 * 32.0f;
+    int idx = (int)idxF;
+    if (idx > 31) idx = 31;
+    float frac = idxF - (float)idx;
+    return kCosineInterpTable[idx] * (1.0f - frac) + kCosineInterpTable[idx + 1] * frac;
 }
 
 // Table for 20^x, x=[0,1]
@@ -607,8 +627,9 @@ _NT_algorithm* construct(const _NT_algorithmMemoryPtrs& ptrs, const _NT_algorith
     alg->prevLofiSampleR = 0.0f;
     alg->lofiPreFilterL = 0.0f;
     alg->lofiPreFilterR = 0.0f;
+    alg->lofiPreFilter2L = 0.0f;
+    alg->lofiPreFilter2R = 0.0f;
     alg->lofiSR = 0.0f;
-    alg->lofiSmooth = 0.0f;
     alg->diffusion = 0.0f;
     alg->drift = 0.0f;
     alg->driftNoiseL = 0.0f;
@@ -696,7 +717,6 @@ void parameterChanged(_NT_algorithm* self, int p) {
             pThis->lofiSR = val * val;
             break;
         }
-        case kParam_LoFiSmooth: pThis->lofiSmooth = self->v[p] / 100.0f; break;
         case kParam_Base: pThis->base = self->v[p] / 127.0f; break;
         case kParam_Width: pThis->width = self->v[p] / 127.0f; break;
         case kParam_Tone: pThis->tone = self->v[p] / 100.0f; break;
@@ -868,10 +888,6 @@ void step(_NT_algorithm* self, float* busFrames, int numFramesBy4) {
     float atkCoeff = 1.0f - expf(-1.0f / (sr * 0.001f)); // 1ms Attack
     float relCoeff = 1.0f - expf(-1.0f / (sr * 0.020f)); // 20ms Release
     const float kLimThreshold = 0.99f; // -0.1 dB
-
-    // Pre-calc Lo-Fi Smooth Gains (Equal Power)
-    float lofiGainZOH = getSineInterp(1.0f - pThis->lofiSmooth);
-    float lofiGainSmooth = getSineInterp(pThis->lofiSmooth);
 
     // Determine BPM
     float bpm = 120.0f;
@@ -1319,44 +1335,47 @@ void step(_NT_algorithm* self, float* busFrames, int numFramesBy4) {
         }
 
         // 3. Process Effects on the Wet Signal (Buffer Read)
-        // Sample Rate Reduction
-        // 1. Calculate Step Size (Frequency)
-        // Logarithmic mapping for "Frequency Ratio" feel
-        float lofiNorm = 1.0f - pThis->smoothedLofiSR;
-        float stepSize = getLinearInterp(lofiNorm, kPow1000Table) * 0.001f;
-
-        // Jitter: Add randomness to the clock rate
+        // Lo-Fi Sample Rate Reduction (Hybrid approach: better filter + cosine interp)
         if (pThis->smoothedLofiSR > 0.001f) {
-            float jitter = (getNoise(pThis->rngState) - 0.5f) * 0.02f * stepSize;
+            // 1. Calculate Step Size (how fast we advance through samples)
+            // Use sqrt curve for more usable range (spreads control across full 0-100%)
+            // stepSize: 1.0 (no reduction) to 0.02 (50x reduction, feedback-safe)
+            float lofiAmount = pThis->smoothedLofiSR;
+            float curve = lofiAmount * lofiAmount; // Quadratic curve for smoother feel
+            float stepSize = 1.0f - (curve * 0.98f); // 1.0 down to 0.02
+
+            // Subtle jitter for analog clock feel
+            float jitter = (getNoise(pThis->rngState) - 0.5f) * 0.01f * stepSize;
             stepSize += jitter;
-        }
-        
-        // 2. Adaptive Pre-Filter (One-pole LPF)
-        // Cutoff tracks the step size to prevent aliasing
-        float alpha = my_min(1.0f, stepSize * 3.0f);
-        pThis->lofiPreFilterL += alpha * (delayL - pThis->lofiPreFilterL);
-        pThis->lofiPreFilterR += alpha * (delayR - pThis->lofiPreFilterR);
-        
-        float inL = pThis->lofiPreFilterL;
-        float inR = pThis->lofiPreFilterR;
+            
+            // 2. Gentle Pre-Filter (anti-aliasing without excessive darkening)
+            // Less aggressive filtering - let the sample rate reduction do the work
+            // Higher minimum alpha = brighter sound even at extreme settings
+            float alpha = my_max(0.08f, my_min(0.6f, stepSize * 0.8f));
+            // First pole
+            pThis->lofiPreFilterL += alpha * (delayL - pThis->lofiPreFilterL);
+            pThis->lofiPreFilterR += alpha * (delayR - pThis->lofiPreFilterR);
+            // Second pole (cascaded for steeper rolloff)
+            pThis->lofiPreFilter2L += alpha * (pThis->lofiPreFilterL - pThis->lofiPreFilter2L);
+            pThis->lofiPreFilter2R += alpha * (pThis->lofiPreFilterR - pThis->lofiPreFilter2R);
+            float inL = pThis->lofiPreFilter2L;
+            float inR = pThis->lofiPreFilter2R;
 
-        // 3. Floating-Point Accumulator
-        pThis->lofiCounter += stepSize;
-        if (pThis->lofiCounter >= 1.0f) {
-            pThis->lofiCounter -= 1.0f;
-            pThis->prevLofiSampleL = pThis->lastLofiSampleL;
-            pThis->prevLofiSampleR = pThis->lastLofiSampleR;
-            pThis->lastLofiSampleL = inL;
-            pThis->lastLofiSampleR = inR;
-        }
+            // 3. Sample-and-Hold with accumulator
+            pThis->lofiCounter += stepSize;
+            if (pThis->lofiCounter >= 1.0f) {
+                pThis->lofiCounter -= 1.0f;
+                pThis->prevLofiSampleL = pThis->lastLofiSampleL;
+                pThis->prevLofiSampleR = pThis->lastLofiSampleR;
+                pThis->lastLofiSampleL = inL;
+                pThis->lastLofiSampleR = inR;
+            }
 
-        // 4. Output Generation (Stepped vs Smooth)
-        float t = pThis->lofiCounter;
-        float smoothL = pThis->prevLofiSampleL + (pThis->lastLofiSampleL - pThis->prevLofiSampleL) * t;
-        float smoothR = pThis->prevLofiSampleR + (pThis->lastLofiSampleR - pThis->prevLofiSampleR) * t;
-        
-        delayL = (pThis->lastLofiSampleL * lofiGainZOH) + (smoothL * lofiGainSmooth);
-        delayR = (pThis->lastLofiSampleR * lofiGainZOH) + (smoothR * lofiGainSmooth);
+            // 4. Cosine Interpolation (smooth S-curve between samples)
+            float t = getCosineInterp(pThis->lofiCounter);
+            delayL = pThis->prevLofiSampleL + (pThis->lastLofiSampleL - pThis->prevLofiSampleL) * t;
+            delayR = pThis->prevLofiSampleR + (pThis->lastLofiSampleR - pThis->prevLofiSampleR) * t;
+        }
 
         // Bit Crush
         if (pThis->bitDepth < 24) {
