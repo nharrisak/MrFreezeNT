@@ -820,7 +820,10 @@ void step(_NT_algorithm* self, float* busFrames, int numFramesBy4) {
         my_abs(pThis->smoothedTone - pThis->lastCalcTone) > 0.001f;
     
     if (needRecalcFilters) {
-        float Q = 0.707f * getLinearInterp(pThis->resonance, kPow20Table);
+        // Q range: 0.4 (gentle roll-off) to ~4 (resonant but feedback-safe)
+        // 0.4 = very gentle slope, 0.707 = Butterworth (flat), higher = resonant peak
+        // Original was 0.707 to 14 which was too aggressive for feedback loops
+        float Q = 0.4f + (pThis->resonance * 3.6f);
         
         // Map Base (0-1) to Freq Norm (20Hz - 20kHz approx)
         float fBase = 0.00025f * getLinearInterp(pThis->smoothedBase, kPow1000Table);
@@ -1014,11 +1017,19 @@ void step(_NT_algorithm* self, float* busFrames, int numFramesBy4) {
                 pThis->currentDriftWidth = 0.0f;
             }
 
-            // 3. Base (Medium Sensitivity)
-            pThis->currentDriftBase = pThis->driftNoiseR * driftAmount * 0.1f;
+            // 3. Base (Medium Sensitivity): Only if not at default (0)
+            if (pThis->base > 0.01f) {
+                pThis->currentDriftBase = pThis->driftNoiseR * pThis->base * driftAmount * 0.1f;
+            } else {
+                pThis->currentDriftBase = 0.0f;
+            }
             
-            // Tone (Medium Sensitivity)
-            pThis->currentDriftTone = pThis->driftNoiseR * driftAmount * 0.1f;
+            // 4. Tone (Medium Sensitivity): Only if not at default (0.5)
+            if (my_abs(pThis->tone - 0.5f) > 0.01f) {
+                pThis->currentDriftTone = pThis->driftNoiseR * (pThis->tone - 0.5f) * driftAmount * 0.2f;
+            } else {
+                pThis->currentDriftTone = 0.0f;
+            }
             
             // 4. Lo-Fi SR & Diffusion (Low Sensitivity)
             if (pThis->lofiSR > 0.01f) pThis->currentDriftLofi = pThis->driftNoiseL * pThis->lofiSR * driftAmount * 0.2f;
