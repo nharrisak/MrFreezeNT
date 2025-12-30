@@ -1546,67 +1546,139 @@ void step(_NT_algorithm* self, float* busFrames, int numFramesBy4) {
 
 bool draw(_NT_algorithm* self) {
     MrFreezeAlgorithm* pThis = (MrFreezeAlgorithm*)self;
-    
-    // 1. Status Header
-    NT_drawText(10, 10, pThis->freeze ? "FROZEN" : "MrFreeze");
-    
-    // 2. Feedback Display
     char buf[32];
-    buf[0] = 'F'; buf[1] = 'B'; buf[2] = ':'; buf[3] = ' ';
+    
+    // Layout: y=0-17 reserved for system parameter bar
+    // Row 1 (y=18): Feedback, Mode, Division, BPM
+    // Waveform (y=28-63): Static 1-division view with playhead
+    // Limiter bar at bottom of waveform
+    
+    // === ROW 1: Status Info (y=18) ===
+    // Feedback (left)
     int fb = pThis->v[kParam_Feedback];
     if (fb <= -60) {
-        NT_drawText(10, 25, "FB: -inf");
+        NT_drawText(0, 18, "FB:-inf", 10);
     } else {
-        int len = NT_intToString(buf + 4, fb);
-        buf[4 + len] = 'd'; buf[4 + len + 1] = 'B'; buf[4 + len + 2] = 0;
-        NT_drawText(10, 25, buf);
+        buf[0] = 'F'; buf[1] = 'B'; buf[2] = ':';
+        int fbLen = NT_intToString(buf + 3, fb);
+        buf[3 + fbLen] = 0;
+        NT_drawText(0, 18, buf, 10);
     }
-
-    // 3. BPM Display
+    
+    // Loop Mode
+    const char* modeStr = "Fwd";
+    if (pThis->loopMode == 1) modeStr = "Rev";
+    else if (pThis->loopMode == 2) modeStr = "P-P";
+    NT_drawText(50, 18, modeStr, pThis->freeze ? 15 : 8);
+    
+    // Division display (e.g., "1/4", "1/4t", "1/4.")
+    static const char* divNames[] = {"1/64","1/32","1/16","1/8","1/4","1/2","1/1","2/1","4/1"};
+    int divIdx = pThis->division;
+    if (divIdx < 0) divIdx = 0;
+    if (divIdx > 8) divIdx = 8;
+    
+    int pos = 0;
+    const char* divName = divNames[divIdx];
+    while (*divName && pos < 8) buf[pos++] = *divName++;
+    if (pThis->triplet == 1) buf[pos++] = 't';
+    else if (pThis->triplet == 2) buf[pos++] = 'T';
+    if (pThis->dotted) buf[pos++] = '.';
+    buf[pos] = 0;
+    NT_drawText(128, 18, buf, 12, kNT_textCentre);
+    
+    // BPM display (right aligned)
     float currentBpm = pThis->tempo;
     if (pThis->sync == 1) currentBpm = pThis->detectedBpm;
     else if (pThis->sync == 2) currentBpm = pThis->detectedMidiBpm;
-    buf[0] = 'B'; buf[1] = 'P'; buf[2] = 'M'; buf[3] = ':'; buf[4] = ' ';
-    NT_floatToString(buf + 5, currentBpm, 1);
-    NT_drawText(80, 25, buf);
-
-    // 4. Waveform Visualization Area (y=32 to 63)
-    NT_drawShapeI(kNT_rectangle, 0, 32, 255, 63, 0); // Clear background
-    NT_drawShapeI(kNT_box, 0, 32, 255, 63, 5);       // Draw border
-
-    // Use smoothedDelayLen so the visual 'stretches' with the pitch drift
+    NT_floatToString(buf, currentBpm, 1);
+    int len = 0; while (buf[len]) len++;
+    buf[len] = 'b'; buf[len+1] = 'p'; buf[len+2] = 'm'; buf[len+3] = 0;
+    NT_drawText(255, 18, buf, 12, kNT_textRight);
+    
+    // === WAVEFORM DISPLAY (y=28 to 63) ===
+    int waveTop = 28;
+    int waveBot = 63;
+    int waveH = waveBot - waveTop;
+    int yMid = waveTop + waveH / 2;
+    
+    // Clear and draw border
+    NT_drawShapeI(kNT_rectangle, 0, waveTop, 255, waveBot, 0);
+    NT_drawShapeI(kNT_box, 0, waveTop, 255, waveBot, 3);
+    
+    // Center line (zero crossing reference)
+    NT_drawShapeI(kNT_line, 1, yMid, 254, yMid, 2);
+    
     float L = pThis->smoothedDelayLen;
     if (L < 1.0f) L = 1.0f;
     
-    uint32_t endPos = pThis->writeHead;
-    int yBase = 48;
-    int lastY = yBase;
+    // Crossfade region width (as fraction of display)
+    float fadeWidth = pThis->crossfade * 0.01f;
+    int fadePixels = (int)(fadeWidth * 254.0f);
     
-    // 5. Draw the History Waveform
-    for (int x = 0; x < 256; ++x) {
-        // Map pixel x to buffer index relative to history
-        float offset = (x * L) / 256.0f;
-        uint32_t idx = (uint32_t)(endPos + pThis->bufferSize - L + offset) % pThis->bufferSize;
+    // Draw crossfade regions (shaded areas at boundaries) - STATIC
+    if (fadePixels > 2 && pThis->crossfade > 1.0f) {
+        // Left crossfade region (loop start)
+        NT_drawShapeI(kNT_rectangle, 1, waveTop + 1, 1 + fadePixels, waveBot - 1, 1);
+        // Right crossfade region (loop end)
+        NT_drawShapeI(kNT_rectangle, 254 - fadePixels, waveTop + 1, 254, waveBot - 1, 1);
+    }
+    
+    // Draw waveform - STATIC view showing last L samples
+    // x=1 is oldest (writeHead - L), x=254 is newest (writeHead)
+    uint32_t loopStart = (pThis->writeHead + pThis->bufferSize - (uint32_t)L) % pThis->bufferSize;
+    int lastY = yMid;
+    int waveColor = pThis->freeze ? 7 : 11;
+    
+    for (int x = 1; x < 255; ++x) {
+        float frac = (float)(x - 1) / 253.0f;
+        uint32_t idx = (loopStart + (uint32_t)(frac * L)) % pThis->bufferSize;
+        float sample = pThis->audioBuffer[idx * 2];
         
-        float sample = pThis->audioBuffer[idx * 2]; 
-        int y = yBase - (int)(sample * 15.0f); 
+        int y = yMid - (int)(sample * (float)(waveH / 2 - 3));
+        if (y < waveTop + 1) y = waveTop + 1;
+        if (y > waveBot - 2) y = waveBot - 2;
         
-        // Clamp to box bounds
-        if (y < 33) y = 33;
-        if (y > 62) y = 62;
-        
-        if (x > 0) {
-            NT_drawShapeI(kNT_line, x - 1, lastY, x, y, 15);
-        }
+        NT_drawShapeI(kNT_line, x - 1, lastY, x, y, waveColor);
         lastY = y;
     }
-
-    // 6. Limiter Activity Bar
-    // Draw a small red bar at the bottom if the limiter is reducing gain
-    if (pThis->limiterGain < 0.999f) {
-        int barWidth = (int)((1.0f - pThis->limiterGain) * 255.0f * 2.0f); // Exaggerate for visibility
-        if (barWidth > 255) barWidth = 255;
-        NT_drawShapeI(kNT_line, 0, 62, barWidth, 62, 10); // Red/Bright line at bottom
+    
+    // Read head position - where in the loop we're currently playing
+    // reversePhase is 0 to L (or 0 to 2L for ping-pong)
+    float readFrac;
+    if (pThis->loopMode == 2) {
+        // Ping-pong: phase 0->L is forward, L->2L is reverse
+        float phase = pThis->reversePhase;
+        float doubleL = L * 2.0f;
+        if (phase >= doubleL) phase -= doubleL;
+        if (phase < L) {
+            readFrac = phase / L; // Forward: 0->1
+        } else {
+            readFrac = (doubleL - phase) / L; // Reverse: 1->0
+        }
+    } else if (pThis->loopMode == 1) {
+        // Reverse: phase goes 0->L but we read backwards
+        readFrac = 1.0f - (pThis->reversePhase / L);
+    } else {
+        // Forward: read position relative to loop
+        readFrac = pThis->reversePhase / L;
+    }
+    if (readFrac < 0.0f) readFrac = 0.0f;
+    if (readFrac > 1.0f) readFrac = 1.0f;
+    
+    int readX = 1 + (int)(readFrac * 253.0f);
+    NT_drawShapeI(kNT_line, readX, waveTop + 1, readX, waveBot - 2, 15);
+    
+    // Limiter gain reduction bar at bottom of waveform
+    if (pThis->limiterGain < 0.995f) {
+        float grDb = 20.0f * log10f(my_max(0.001f, pThis->limiterGain));
+        float grNorm = my_min(1.0f, my_abs(grDb) / 12.0f);
+        int grWidth = (int)(grNorm * 253.0f);
+        if (grWidth > 0) {
+            NT_drawShapeI(kNT_rectangle, 1, waveBot - 1, 1 + grWidth, waveBot - 1, 14);
+        }
+        // Show dB value
+        NT_floatToString(buf, grDb, 1);
+        NT_drawText(254, waveBot - 8, buf, 14, kNT_textRight, kNT_textTiny);
     }
 
     return false;
