@@ -47,6 +47,10 @@ struct MrFreezeAlgorithm : public _NT_algorithm {
     int loopMode;
     int sync;
     int midiChannel;
+    int midiMode;      // 0=Off, 1=Momentary, 2=Latch
+    int noteBase;      // Index into base divisions for MIDI keyboard
+    int blackKeys;     // 0=Dotted, 1=Triplet
+    int lastMidiNote;  // Track which note is held (for latch toggle)
     float tempo;
     float feedback;
     float resonance;
@@ -208,6 +212,10 @@ enum {
     kParam_EnvRes,
     kParam_EnvLoFi,
     kParam_EnvDiff,
+    // Page 5: MIDI Mapping
+    kParam_MidiMode,
+    kParam_NoteBase,
+    kParam_BlackKeys,
     kNumParameters
 };
 
@@ -222,12 +230,15 @@ static const uint32_t kGuid = NT_MULTICHAR('M', 'r', 'F', 'z');
 
 // Enum Strings
 static const char* const s_offOn[] = { "Off", "On", nullptr };
-static const char* const s_divs[] = { "1/64", "1/32", "1/16", "1/8", "1/4", "1/2", "1/1", "2/1", "4/1", nullptr };
+static const char* const s_divs[] = { "1/128", "1/64", "1/32", "1/16", "1/8", "1/4", "1/2", "1/1", "2/1", "4/1", "8/1", "16/1", "32/1", nullptr };
 static const char* const s_triplet[] = { "Off", "x3", "/3", nullptr };
 static const char* const s_dotted[] = { "Off", "x1.5", nullptr };
 static const char* const s_loopMode[] = { "Fwd", "Rev", "PingPong", nullptr };
 static const char* const s_sync[] = { "Int", "Clock", "MIDI", nullptr };
 static const char* const s_envTimes[] = { "1/2", "1", "2", "1 bar", "2 bar", "4 bar", "8 bar", "16 bar", "32 bar", nullptr }; // beats, then bars
+static const char* const s_midiMode[] = { "Off", "Momentary", "Latch", nullptr };
+static const char* const s_noteBase[] = { "1/128", "1/64", "1/32", "1/16", "1/8", "1/4", "1/2", nullptr };
+static const char* const s_blackKeys[] = { "Dotted", "Triplet", nullptr };
 
 // Parameter definitions
 static const _NT_parameter parameters[] = {
@@ -242,7 +253,7 @@ static const _NT_parameter parameters[] = {
 
     // Page 2: Performance & Timing
     [kParam_Freeze]   = { .name = "Freeze",    .min = 0, .max = 1, .def = 0, .unit = kNT_unitEnum, .enumStrings = s_offOn },
-    [kParam_Division] = { .name = "Division",  .min = 0, .max = 8, .def = 4, .unit = kNT_unitEnum, .enumStrings = s_divs },
+    [kParam_Division] = { .name = "Division",  .min = 0, .max = 12, .def = 5, .unit = kNT_unitEnum, .enumStrings = s_divs },
     [kParam_Triplet]  = { .name = "Triplet",   .min = 0, .max = 2, .def = 0, .unit = kNT_unitEnum, .enumStrings = s_triplet },
     [kParam_Dotted]   = { .name = "Dotted",    .min = 0, .max = 1, .def = 0, .unit = kNT_unitEnum, .enumStrings = s_dotted },
     [kParam_Crossfade]= { .name = "Crossfade %",.min = 0, .max = 50, .def = 10, .unit = kNT_unitPercent },
@@ -274,19 +285,26 @@ static const _NT_parameter parameters[] = {
     [kParam_EnvRes]   = { .name = "Env>Res",  .min = -100, .max = 100, .def = 0, .unit = kNT_unitPercent },
     [kParam_EnvLoFi]  = { .name = "Env>LoFi", .min = -100, .max = 100, .def = 0, .unit = kNT_unitPercent },
     [kParam_EnvDiff]  = { .name = "Env>Diff", .min = -100, .max = 100, .def = 0, .unit = kNT_unitPercent },
+
+    // Page 5: MIDI Mapping
+    [kParam_MidiMode] = { .name = "MIDI Mode", .min = 0, .max = 2, .def = 1, .unit = kNT_unitEnum, .enumStrings = s_midiMode },
+    [kParam_NoteBase] = { .name = "Note Base", .min = 0, .max = 6, .def = 3, .unit = kNT_unitEnum, .enumStrings = s_noteBase },
+    [kParam_BlackKeys]= { .name = "Black Keys",.min = 0, .max = 1, .def = 0, .unit = kNT_unitEnum, .enumStrings = s_blackKeys },
 };
 
 // Parameter pages
 static const uint8_t page1[] = { kParam_DryInL, kParam_DryInR, kParam_FBInL, kParam_FBInR, kParam_ClockIn, kParam_OutL, kParam_OutL_Mode, kParam_OutR, kParam_OutR_Mode };
-static const uint8_t page2[] = { kParam_Freeze, kParam_Division, kParam_Triplet, kParam_Dotted, kParam_Crossfade, kParam_PingPong, kParam_LoopMode, kParam_Sync, kParam_MidiChannel, kParam_Tempo };
+static const uint8_t page2[] = { kParam_Freeze, kParam_Division, kParam_Triplet, kParam_Dotted, kParam_Crossfade, kParam_PingPong, kParam_LoopMode, kParam_Sync, kParam_Tempo };
 static const uint8_t page3[] = { kParam_Feedback, kParam_Resonance, kParam_Base, kParam_Width, kParam_Tone, kParam_BitDepth, kParam_LoFiSR, kParam_TapeSat, kParam_Diffusion, kParam_Drift };
 static const uint8_t page4[] = { kParam_EnvAttack, kParam_EnvDecay, kParam_EnvCurve, kParam_EnvBase, kParam_EnvWidth, kParam_EnvTone, kParam_EnvRes, kParam_EnvLoFi, kParam_EnvDiff };
+static const uint8_t page5[] = { kParam_MidiChannel, kParam_MidiMode, kParam_NoteBase, kParam_BlackKeys };
 
 static const _NT_parameterPage pages[] = {
     { .name = "Routing & I/O", .numParams = ARRAY_SIZE(page1), .params = page1 },
     { .name = "Performance",   .numParams = ARRAY_SIZE(page2), .params = page2 },
     { .name = "Character",     .numParams = ARRAY_SIZE(page3), .params = page3 },
     { .name = "Envelope Mod",  .numParams = ARRAY_SIZE(page4), .params = page4 },
+    { .name = "MIDI Mapping",  .numParams = ARRAY_SIZE(page5), .params = page5 },
 };
 static const _NT_parameterPages parameterPages = {
     .numPages = ARRAY_SIZE(pages),
@@ -616,7 +634,11 @@ _NT_algorithm* construct(const _NT_algorithmMemoryPtrs& ptrs, const _NT_algorith
     alg->outRMode = 0;
     alg->sync = 1;
     alg->midiChannel = 0;
-    alg->division = 4;
+    alg->midiMode = 1;      // Momentary
+    alg->noteBase = 3;      // 1/16
+    alg->blackKeys = 0;     // Dotted
+    alg->lastMidiNote = -1;
+    alg->division = 5;      // 1/4 (new index after adding 1/128)
     alg->tempo = 120.0f;
     alg->lastClockSample = 0.0f;
     alg->framesSinceLastClock = 0;
@@ -794,6 +816,10 @@ void parameterChanged(_NT_algorithm* self, int p) {
         case kParam_EnvRes: pThis->envModRes = self->v[p] / 100.0f; break;
         case kParam_EnvLoFi: pThis->envModLoFi = self->v[p] / 100.0f; break;
         case kParam_EnvDiff: pThis->envModDiff = self->v[p] / 100.0f; break;
+        // MIDI Mapping parameters
+        case kParam_MidiMode: pThis->midiMode = (int)self->v[p]; break;
+        case kParam_NoteBase: pThis->noteBase = (int)self->v[p]; break;
+        case kParam_BlackKeys: pThis->blackKeys = (int)self->v[p]; break;
         default: break;
     }
 }
@@ -840,28 +866,95 @@ void midiMessage(_NT_algorithm* self, uint8_t byte0, uint8_t byte1, uint8_t byte
     int status = byte0 & 0xF0;
     int channel = byte0 & 0x0F;
 
+    // Check MIDI channel filter (0 = Omni/all channels)
     if (pThis->midiChannel > 0 && channel != (pThis->midiChannel - 1)) {
         return;
     }
     
+    // If MIDI mode is Off, ignore note messages
+    if (pThis->midiMode == 0) {
+        return;
+    }
+    
     if (status == 0x90 && byte2 > 0) { // Note On
-        pThis->activeNoteCount++;
+        int note = byte1 % 12;
         
-        // Map note to division (wrap around octave)
-        int div = byte1 % 12;
-        if (div <= 8) {
-            NT_setParameterFromAudio(NT_algorithmIndex(self), kParam_Division + NT_parameterOffset(), div);
+        // Keyboard mapping:
+        // White keys: C(0), D(2), E(4), F(5), G(7), A(9), B(11) -> divisions (×1, ×2, ×4, ×8, ×16, ×32, ×64)
+        // Black keys: C#(1), D#(3), F#(6), G#(8), A#(10) -> modified version of preceding white key
+        
+        // Map note to white key offset (0-6) and whether it's a black key
+        int whiteKeyOffset = -1;
+        int isBlackKey = 0;
+        int precedingWhiteOffset = 0;
+        
+        switch (note) {
+            case 0:  whiteKeyOffset = 0; break; // C
+            case 1:  isBlackKey = 1; precedingWhiteOffset = 0; break; // C#
+            case 2:  whiteKeyOffset = 1; break; // D
+            case 3:  isBlackKey = 1; precedingWhiteOffset = 1; break; // D#
+            case 4:  whiteKeyOffset = 2; break; // E
+            case 5:  whiteKeyOffset = 3; break; // F
+            case 6:  isBlackKey = 1; precedingWhiteOffset = 3; break; // F#
+            case 7:  whiteKeyOffset = 4; break; // G
+            case 8:  isBlackKey = 1; precedingWhiteOffset = 4; break; // G#
+            case 9:  whiteKeyOffset = 5; break; // A
+            case 10: isBlackKey = 1; precedingWhiteOffset = 5; break; // A#
+            case 11: whiteKeyOffset = 6; break; // B
         }
         
-        if (pThis->activeNoteCount == 1) {
-            NT_setParameterFromAudio(NT_algorithmIndex(self), kParam_Freeze + NT_parameterOffset(), 1);
+        // Calculate division index
+        int divIndex;
+        int tripletVal = 0;
+        int dottedVal = 0;
+        
+        if (isBlackKey) {
+            divIndex = pThis->noteBase + precedingWhiteOffset;
+            if (pThis->blackKeys == 0) {
+                dottedVal = 1; // Dotted (×1.5)
+            } else {
+                tripletVal = 2; // Triplet /3 (slower, ×1.33)
+            }
+        } else {
+            divIndex = pThis->noteBase + whiteKeyOffset;
         }
+        
+        // Clamp division index to valid range (0-12)
+        if (divIndex < 0) divIndex = 0;
+        if (divIndex > 12) divIndex = 12;
+        
+        // Set division and modifiers
+        NT_setParameterFromAudio(NT_algorithmIndex(self), kParam_Division + NT_parameterOffset(), divIndex);
+        NT_setParameterFromAudio(NT_algorithmIndex(self), kParam_Triplet + NT_parameterOffset(), tripletVal);
+        NT_setParameterFromAudio(NT_algorithmIndex(self), kParam_Dotted + NT_parameterOffset(), dottedVal);
+        
+        // Handle freeze based on mode
+        if (pThis->midiMode == 1) { // Momentary
+            pThis->activeNoteCount++;
+            if (pThis->activeNoteCount == 1) {
+                NT_setParameterFromAudio(NT_algorithmIndex(self), kParam_Freeze + NT_parameterOffset(), 1);
+            }
+        } else if (pThis->midiMode == 2) { // Latch
+            if (pThis->lastMidiNote == byte1 && pThis->freeze) {
+                // Same note pressed again while frozen -> unfreeze
+                NT_setParameterFromAudio(NT_algorithmIndex(self), kParam_Freeze + NT_parameterOffset(), 0);
+                pThis->lastMidiNote = -1;
+            } else {
+                // New note or not frozen -> freeze
+                NT_setParameterFromAudio(NT_algorithmIndex(self), kParam_Freeze + NT_parameterOffset(), 1);
+                pThis->lastMidiNote = byte1;
+            }
+        }
+        
     } else if (status == 0x80 || (status == 0x90 && byte2 == 0)) { // Note Off
-        pThis->activeNoteCount--;
-        if (pThis->activeNoteCount <= 0) {
-            pThis->activeNoteCount = 0;
-            NT_setParameterFromAudio(NT_algorithmIndex(self), kParam_Freeze + NT_parameterOffset(), 0);
+        if (pThis->midiMode == 1) { // Momentary
+            pThis->activeNoteCount--;
+            if (pThis->activeNoteCount <= 0) {
+                pThis->activeNoteCount = 0;
+                NT_setParameterFromAudio(NT_algorithmIndex(self), kParam_Freeze + NT_parameterOffset(), 0);
+            }
         }
+        // Latch mode: note off does nothing
     }
 }
 
@@ -1003,18 +1096,22 @@ void step(_NT_algorithm* self, float* busFrames, int numFramesBy4) {
     }
 
     // Calculate Delay Time in Samples
-    // Division map: 0=1/64, 1=1/32, 2=1/16, 3=1/8, 4=1/4, 5=1/2, 6=1/1
+    // Division map: 0=1/128, 1=1/64, 2=1/32, 3=1/16, 4=1/8, 5=1/4, 6=1/2, 7=1/1, 8=2/1, 9=4/1, 10=8/1, 11=16/1, 12=32/1
     float beats = 1.0f;
     switch(pThis->division) {
-        case 0: beats = 0.0625f; break;
-        case 1: beats = 0.125f; break;
-        case 2: beats = 0.25f; break;
-        case 3: beats = 0.5f; break;
-        case 4: beats = 1.0f; break;
-        case 5: beats = 2.0f; break;
-        case 6: beats = 4.0f; break;
-        case 7: beats = 8.0f; break;
-        case 8: beats = 16.0f; break;
+        case 0:  beats = 0.03125f; break; // 1/128
+        case 1:  beats = 0.0625f; break;  // 1/64
+        case 2:  beats = 0.125f; break;   // 1/32
+        case 3:  beats = 0.25f; break;    // 1/16
+        case 4:  beats = 0.5f; break;     // 1/8
+        case 5:  beats = 1.0f; break;     // 1/4
+        case 6:  beats = 2.0f; break;     // 1/2
+        case 7:  beats = 4.0f; break;     // 1/1
+        case 8:  beats = 8.0f; break;     // 2/1
+        case 9:  beats = 16.0f; break;    // 4/1
+        case 10: beats = 32.0f; break;    // 8/1
+        case 11: beats = 64.0f; break;    // 16/1
+        case 12: beats = 128.0f; break;   // 32/1
     }
     // Triplet: 0=Off, 1=x3 (fast), 2=/3 (slow)
     if (pThis->triplet == 1) beats /= 3.0f;
