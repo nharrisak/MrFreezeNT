@@ -91,6 +91,22 @@ struct MrFreezeAlgorithm : public _NT_algorithm {
     bool wasFrozen;
     uint32_t currentDelayLen;
     float currentDryGain;
+    
+    // Envelope State
+    float envValue;          // Current envelope value 0.0 to 1.0
+    int envStage;            // 0=idle, 1=attack, 2=decay
+    float envPhase;          // Progress within current stage 0.0 to 1.0
+    bool envGate;            // Envelope is active
+    bool envTriggeredByMidi; // Track if current envelope was MIDI-triggered
+    int envAttackBeats;      // Attack time in beat divisions
+    int envDecayBeats;       // Decay time in beat divisions
+    float envCurve;          // -1=log, 0=linear, +1=exponential
+    float envModBase;        // Modulation amount for Base (-1 to +1)
+    float envModWidth;       // Modulation amount for Width
+    float envModTone;        // Modulation amount for Tone
+    float envModRes;         // Modulation amount for Resonance
+    float envModLoFi;        // Modulation amount for Lo-Fi
+    float envModDiff;        // Modulation amount for Diffusion
 
     // Tape State
     TapeState tapeL, tapeR;
@@ -99,6 +115,7 @@ struct MrFreezeAlgorithm : public _NT_algorithm {
     float smoothedBase;
     float smoothedWidth;
     float smoothedTone;
+    float smoothedResonance;
     float smoothedDelayLen;
     float fadeTargetLen;
     float fadeOldLen;
@@ -181,6 +198,16 @@ enum {
     kParam_TapeSat,
     kParam_Diffusion,
     kParam_Drift,
+    // Page 4: Envelope Modulation
+    kParam_EnvAttack,
+    kParam_EnvDecay,
+    kParam_EnvCurve,
+    kParam_EnvBase,
+    kParam_EnvWidth,
+    kParam_EnvTone,
+    kParam_EnvRes,
+    kParam_EnvLoFi,
+    kParam_EnvDiff,
     kNumParameters
 };
 
@@ -200,6 +227,7 @@ static const char* const s_triplet[] = { "Off", "x3", "/3", nullptr };
 static const char* const s_dotted[] = { "Off", "x1.5", nullptr };
 static const char* const s_loopMode[] = { "Fwd", "Rev", "PingPong", nullptr };
 static const char* const s_sync[] = { "Int", "Clock", "MIDI", nullptr };
+static const char* const s_envTimes[] = { "1/2", "1", "2", "1 bar", "2 bar", "4 bar", "8 bar", "16 bar", "32 bar", nullptr }; // beats, then bars
 
 // Parameter definitions
 static const _NT_parameter parameters[] = {
@@ -235,17 +263,30 @@ static const _NT_parameter parameters[] = {
     [kParam_TapeSat]  = { .name = "Tape Sat", .min = 0, .max = 100, .def = 0, .unit = kNT_unitPercent },
     [kParam_Diffusion]= { .name = "Diffusion",.min = 0, .max = 100, .def = 0, .unit = kNT_unitPercent },
     [kParam_Drift]    = { .name = "Drift",    .min = 0, .max = 100, .def = 0, .unit = kNT_unitPercent },
+
+    // Page 4: Envelope Modulation
+    [kParam_EnvAttack]= { .name = "Env Atk",  .min = 0, .max = 8, .def = 1, .unit = kNT_unitEnum, .enumStrings = s_envTimes },
+    [kParam_EnvDecay] = { .name = "Env Dec",  .min = 0, .max = 8, .def = 3, .unit = kNT_unitEnum, .enumStrings = s_envTimes },
+    [kParam_EnvCurve] = { .name = "Env Curve",.min = -100, .max = 100, .def = 50, .unit = kNT_unitPercent },
+    [kParam_EnvBase]  = { .name = "Env>Base", .min = -100, .max = 100, .def = 0, .unit = kNT_unitPercent },
+    [kParam_EnvWidth] = { .name = "Env>Width",.min = -100, .max = 100, .def = 0, .unit = kNT_unitPercent },
+    [kParam_EnvTone]  = { .name = "Env>Tone", .min = -100, .max = 100, .def = 0, .unit = kNT_unitPercent },
+    [kParam_EnvRes]   = { .name = "Env>Res",  .min = -100, .max = 100, .def = 0, .unit = kNT_unitPercent },
+    [kParam_EnvLoFi]  = { .name = "Env>LoFi", .min = -100, .max = 100, .def = 0, .unit = kNT_unitPercent },
+    [kParam_EnvDiff]  = { .name = "Env>Diff", .min = -100, .max = 100, .def = 0, .unit = kNT_unitPercent },
 };
 
 // Parameter pages
 static const uint8_t page1[] = { kParam_DryInL, kParam_DryInR, kParam_FBInL, kParam_FBInR, kParam_ClockIn, kParam_OutL, kParam_OutL_Mode, kParam_OutR, kParam_OutR_Mode };
 static const uint8_t page2[] = { kParam_Freeze, kParam_Division, kParam_Triplet, kParam_Dotted, kParam_Crossfade, kParam_PingPong, kParam_LoopMode, kParam_Sync, kParam_MidiChannel, kParam_Tempo };
 static const uint8_t page3[] = { kParam_Feedback, kParam_Resonance, kParam_Base, kParam_Width, kParam_Tone, kParam_BitDepth, kParam_LoFiSR, kParam_TapeSat, kParam_Diffusion, kParam_Drift };
+static const uint8_t page4[] = { kParam_EnvAttack, kParam_EnvDecay, kParam_EnvCurve, kParam_EnvBase, kParam_EnvWidth, kParam_EnvTone, kParam_EnvRes, kParam_EnvLoFi, kParam_EnvDiff };
 
 static const _NT_parameterPage pages[] = {
     { .name = "Routing & I/O", .numParams = ARRAY_SIZE(page1), .params = page1 },
     { .name = "Performance",   .numParams = ARRAY_SIZE(page2), .params = page2 },
     { .name = "Character",     .numParams = ARRAY_SIZE(page3), .params = page3 },
+    { .name = "Envelope Mod",  .numParams = ARRAY_SIZE(page4), .params = page4 },
 };
 static const _NT_parameterPages parameterPages = {
     .numPages = ARRAY_SIZE(pages),
@@ -595,6 +636,22 @@ _NT_algorithm* construct(const _NT_algorithmMemoryPtrs& ptrs, const _NT_algorith
     alg->currentDelayLen = 0;
     alg->currentDryGain = 1.0f;
     alg->crossfade = 10.0f;
+    
+    // Envelope state
+    alg->envValue = 0.0f;
+    alg->envStage = 0;
+    alg->envPhase = 0.0f;
+    alg->envGate = false;
+    alg->envTriggeredByMidi = false;
+    alg->envAttackBeats = 1;  // Default 1 beat
+    alg->envDecayBeats = 3;   // Default 1 bar (4 beats)
+    alg->envCurve = 0.5f;     // Default slightly exponential
+    alg->envModBase = 0.0f;
+    alg->envModWidth = 0.0f;
+    alg->envModTone = 0.0f;
+    alg->envModRes = 0.0f;
+    alg->envModLoFi = 0.0f;
+    alg->envModDiff = 0.0f;
     alg->lpfStateL = {};
     alg->lpfStateR = {};
     alg->hpfStateL = {};
@@ -610,6 +667,7 @@ _NT_algorithm* construct(const _NT_algorithmMemoryPtrs& ptrs, const _NT_algorith
     alg->smoothedBase = 0.0f;
     alg->smoothedWidth = 1.0f;
     alg->smoothedTone = 0.5f;
+    alg->smoothedResonance = 0.0f;
     // Initialize delay lengths to 0.5 seconds at current sample rate
     float initialDelayLen = sampleRate * 0.5f;
     alg->smoothedDelayLen = initialDelayLen;
@@ -726,6 +784,16 @@ void parameterChanged(_NT_algorithm* self, int p) {
             break;
         }
         case kParam_Drift: pThis->drift = self->v[p] / 100.0f; break;
+        // Envelope parameters
+        case kParam_EnvAttack: pThis->envAttackBeats = (int)self->v[p]; break;
+        case kParam_EnvDecay: pThis->envDecayBeats = (int)self->v[p]; break;
+        case kParam_EnvCurve: pThis->envCurve = self->v[p] / 100.0f; break;
+        case kParam_EnvBase: pThis->envModBase = self->v[p] / 100.0f; break;
+        case kParam_EnvWidth: pThis->envModWidth = self->v[p] / 100.0f; break;
+        case kParam_EnvTone: pThis->envModTone = self->v[p] / 100.0f; break;
+        case kParam_EnvRes: pThis->envModRes = self->v[p] / 100.0f; break;
+        case kParam_EnvLoFi: pThis->envModLoFi = self->v[p] / 100.0f; break;
+        case kParam_EnvDiff: pThis->envModDiff = self->v[p] / 100.0f; break;
         default: break;
     }
 }
@@ -834,7 +902,7 @@ void step(_NT_algorithm* self, float* busFrames, int numFramesBy4) {
     bool needRecalcFilters = !pThis->coeffsInitialized ||
         my_abs(pThis->smoothedBase - pThis->lastCalcBase) > 0.001f ||
         my_abs(pThis->smoothedWidth - pThis->lastCalcWidth) > 0.001f ||
-        my_abs(pThis->resonance - pThis->lastCalcResonance) > 0.001f;
+        my_abs(pThis->smoothedResonance - pThis->lastCalcResonance) > 0.001f;
     
     bool needRecalcTilt = !pThis->coeffsInitialized ||
         my_abs(pThis->smoothedTone - pThis->lastCalcTone) > 0.001f;
@@ -843,7 +911,7 @@ void step(_NT_algorithm* self, float* busFrames, int numFramesBy4) {
         // Q range: 0.4 (gentle roll-off) to ~4 (resonant but feedback-safe)
         // 0.4 = very gentle slope, 0.707 = Butterworth (flat), higher = resonant peak
         // Original was 0.707 to 14 which was too aggressive for feedback loops
-        float Q = 0.4f + (pThis->resonance * 3.6f);
+        float Q = 0.4f + (pThis->smoothedResonance * 3.6f);
         
         // Map Base (0-1) to Freq Norm (20Hz - 20kHz approx)
         float fBase = 0.00025f * getLinearInterp(pThis->smoothedBase, kPow1000Table);
@@ -860,7 +928,7 @@ void step(_NT_algorithm* self, float* busFrames, int numFramesBy4) {
         
         pThis->lastCalcBase = pThis->smoothedBase;
         pThis->lastCalcWidth = pThis->smoothedWidth;
-        pThis->lastCalcResonance = pThis->resonance;
+        pThis->lastCalcResonance = pThis->smoothedResonance;
     }
     
     if (needRecalcTilt) {
@@ -1000,6 +1068,86 @@ void step(_NT_algorithm* self, float* busFrames, int numFramesBy4) {
     if (W_fade < 1) W_fade = 1;
     float dryFadeStep = 1.0f / (float)W_fade;
 
+    // --- Envelope Generator ---
+    // Trigger on freeze rising edge (but not if already running from MIDI legato)
+    if (pThis->freeze && !pThis->wasFrozen) {
+        // Check legato: if this was a MIDI trigger and notes were held, don't retrigger
+        bool shouldTrigger = true;
+        if (pThis->envTriggeredByMidi && pThis->envGate) {
+            // Legato - don't retrigger
+            shouldTrigger = false;
+        }
+        if (shouldTrigger) {
+            pThis->envStage = 1; // Attack
+            pThis->envPhase = 0.0f;
+            pThis->envGate = true;
+            pThis->envTriggeredByMidi = (pThis->activeNoteCount > 0);
+        }
+    }
+    // Release when freeze goes off
+    if (!pThis->freeze && pThis->wasFrozen) {
+        pThis->envTriggeredByMidi = false;
+        // Let envelope complete its decay naturally
+    }
+    
+    // Convert envelope time index to beats: 0=1/2, 1=1, 2=2, 3=1bar(4), 4=2bar(8), 5=4bar(16), 6=8bar(32), 7=16bar(64), 8=32bar(128)
+    static const float envTimeBeats[] = { 0.5f, 1.0f, 2.0f, 4.0f, 8.0f, 16.0f, 32.0f, 64.0f, 128.0f };
+    float attackBeats = envTimeBeats[pThis->envAttackBeats];
+    float decayBeats = envTimeBeats[pThis->envDecayBeats];
+    
+    // Calculate phase increment per sample
+    float attackSamples = samplesPerBeat * attackBeats;
+    float decaySamples = samplesPerBeat * decayBeats;
+    float attackInc = (attackSamples > 0.0f) ? (1.0f / attackSamples) : 1.0f;
+    float decayInc = (decaySamples > 0.0f) ? (1.0f / decaySamples) : 1.0f;
+    
+    // Continuous curve: -1=log (fast start), 0=linear, +1=exp (slow start)
+    // Power ranges from 0.25 (log) through 1.0 (linear) to 4.0 (exp)
+    float curvePower = powf(2.0f, pThis->envCurve * 2.0f);
+    
+    // Update envelope (per block, multiply by numFrames)
+    if (pThis->envStage == 1) { // Attack
+        pThis->envPhase += attackInc * numFrames;
+        if (pThis->envPhase >= 1.0f) {
+            pThis->envPhase = 0.0f;
+            pThis->envStage = 2; // Move to decay
+            pThis->envValue = 1.0f;
+        } else {
+            // Calculate envelope value with curve
+            float t = my_min(1.0f, pThis->envPhase);
+            pThis->envValue = powf(t, curvePower);
+        }
+    } else if (pThis->envStage == 2) { // Decay
+        pThis->envPhase += decayInc * numFrames;
+        if (pThis->envPhase >= 1.0f) {
+            pThis->envPhase = 1.0f;
+            pThis->envStage = 0; // Done
+            pThis->envGate = false;
+            pThis->envValue = 0.0f;
+        } else {
+            // Invert decay curve for natural feel
+            float t = pThis->envPhase;
+            pThis->envValue = 1.0f - powf(t, curvePower);
+        }
+    }
+    
+    // Apply envelope modulation to parameters
+    float envMod = pThis->envValue;
+    float modBase = pThis->base + (pThis->envModBase * envMod);
+    float modWidth = pThis->width + (pThis->envModWidth * envMod);
+    float modTone = pThis->tone + (pThis->envModTone * envMod * 0.5f); // Scale tone mod
+    float modRes = pThis->resonance + (pThis->envModRes * envMod);
+    float modLoFi = pThis->lofiSR + (pThis->envModLoFi * envMod);
+    float modDiff = pThis->diffusion + (pThis->envModDiff * envMod);
+    
+    // Clamp modulated values
+    modBase = my_max(0.0f, my_min(1.0f, modBase));
+    modWidth = my_max(0.0f, my_min(1.0f, modWidth));
+    modTone = my_max(0.0f, my_min(1.0f, modTone));
+    modRes = my_max(0.0f, my_min(1.0f, modRes));
+    modLoFi = my_max(0.0f, my_min(1.0f, modLoFi));
+    modDiff = my_max(0.0f, my_min(1.0f, modDiff));
+
     pThis->wasFrozen = pThis->freeze;
 
     // --- Global Drift Calculation (Decimated Block Rate) ---
@@ -1090,22 +1238,26 @@ void step(_NT_algorithm* self, float* busFrames, int numFramesBy4) {
             if (currentSlew < 0.0005f) currentSlew = 0.0005f;
         }
 
-        float targetBase = my_max(0.0f, my_min(1.0f, pThis->base + pThis->currentDriftBase));
+        // Use envelope-modulated values as base, then add drift
+        float targetBase = my_max(0.0f, my_min(1.0f, modBase + pThis->currentDriftBase));
         pThis->smoothedBase += (targetBase - pThis->smoothedBase) * currentSlew;
-        float targetWidth = my_max(0.0f, my_min(1.0f, pThis->width + pThis->currentDriftWidth));
+        float targetWidth = my_max(0.0f, my_min(1.0f, modWidth + pThis->currentDriftWidth));
         pThis->smoothedWidth += (targetWidth - pThis->smoothedWidth) * currentSlew;
         
-        float targetTone = my_max(0.0f, my_min(1.0f, pThis->tone + pThis->currentDriftTone));
+        float targetTone = my_max(0.0f, my_min(1.0f, modTone + pThis->currentDriftTone));
         pThis->smoothedTone += (targetTone - pThis->smoothedTone) * currentSlew;
         
-        float targetLofi = my_max(0.0f, my_min(1.0f, pThis->lofiSR + pThis->currentDriftLofi));
+        float targetLofi = my_max(0.0f, my_min(1.0f, modLoFi + pThis->currentDriftLofi));
         pThis->smoothedLofiSR += (targetLofi - pThis->smoothedLofiSR) * currentSlew;
         
-        float targetDiff = my_max(0.0f, my_min(1.0f, pThis->diffusion + pThis->currentDriftDiff));
+        float targetDiff = my_max(0.0f, my_min(1.0f, modDiff + pThis->currentDriftDiff));
         pThis->smoothedDiffusion += (targetDiff - pThis->smoothedDiffusion) * currentSlew;
 
         float targetFb = my_max(0.0f, pThis->feedback + pThis->currentDriftFeedback);
         pThis->smoothedFeedback += (targetFb - pThis->smoothedFeedback) * currentSlew;
+        
+        // Resonance smoothing (includes envelope modulation)
+        pThis->smoothedResonance += (modRes - pThis->smoothedResonance) * currentSlew;
 
         // 1. Detect Macro Jumps (e.g., changing divisions)
         float targetLen = (float)pThis->currentDelayLen;
@@ -1585,6 +1737,19 @@ bool draw(_NT_algorithm* self) {
     if (pThis->dotted) buf[pos++] = '.';
     buf[pos] = 0;
     NT_drawText(128, 18, buf, 12, kNT_textCentre);
+    
+    // Envelope indicator (small bar, between division and BPM)
+    if (pThis->envStage > 0 || pThis->envValue > 0.01f) {
+        // Draw small vertical bar showing envelope level
+        int envBarH = (int)(pThis->envValue * 8.0f);
+        if (envBarH > 0) {
+            int envX = 170;
+            NT_drawShapeI(kNT_rectangle, envX, 18 + 8 - envBarH, envX + 3, 18 + 8, 15);
+        }
+        // Show stage indicator
+        const char* envLabel = (pThis->envStage == 1) ? "A" : "D";
+        NT_drawText(175, 18, envLabel, 8);
+    }
     
     // BPM display (right aligned)
     float currentBpm = pThis->tempo;
